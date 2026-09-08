@@ -10,7 +10,7 @@ import uvicorn
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Unlimited-OCR MLX FastAPI server")
-    parser.add_argument("--host", default=os.environ.get("OCR_HOST", "0.0.0.0"))
+    parser.add_argument("--host", default=os.environ.get("OCR_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("OCR_PORT", "8300")))
     parser.add_argument(
         "--model-ref",

@@ -21,10 +21,11 @@ uv run python scripts/download_model.py   # optional; first server start downloa
 ## Run
 
 ```bash
-uv run ocr-server                       # 0.0.0.0:8300, model loads on startup
+uv run ocr-server                        # http://localhost:8300, model loads on startup
+uv run ocr-server --host 0.0.0.0         # LAN-accessible: other machines use http://<this-mac-ip>:8300
 uv run ocr-server --port 8301 --model-ref /path/to/local/model
-uv run ocr-server --fake-engine         # no model; stub responses for client dev
-uv run pytest                           # API tests run against the fake engine
+uv run ocr-server --fake-engine          # no model; stub responses for client dev
+uv run pytest                            # API tests run against the fake engine
 ```
 
 First start with the real model: downloads (~3.7 GB) + weight load; allow a few
@@ -41,7 +42,7 @@ uv run ocr-server --host 0.0.0.0 --port 8300 \
 
 | what | CLI flag | env var | default |
 |---|---|---|---|
-| Bind address | `--host` | `OCR_HOST` | `0.0.0.0` |
+| Bind address | `--host` | `OCR_HOST` | `127.0.0.1` (set `0.0.0.0` for LAN access) |
 | Port | `--port` | `OCR_PORT` | `8300` |
 | OCR model | `--model-ref` | `OCR_MODEL_REF` | `sahilchachra/unlimited-ocr-mxfp8-mlx` |
 | Cleanup stage | — | `OCR_CLEANUP` | `1` (set `0` to disable) |
@@ -135,19 +136,22 @@ Disable with `OCR_CLEANUP=0`; swap the model with `OCR_CLEANUP_MODEL=<hf-repo>`.
 ### curl
 
 ```bash
-curl -s http://mac.local:8300/health
+curl -s http://localhost:8300/health
 
 curl -s -F file=@scan.pdf -F pages=1-3,5 \
-  http://mac.local:8300/parse/pdf | jq -r '.results[].markdown' > out.md
+  http://localhost:8300/parse/pdf | jq -r '.results[].markdown' > out.md
 
-curl -s -F file=@photo.jpg http://mac.local:8300/parse/image | jq -r '.results[0].markdown'
+curl -s -F file=@photo.jpg http://localhost:8300/parse/image | jq -r '.results[0].markdown'
+
+# From another machine on the LAN (requires --host 0.0.0.0 and the firewall
+# allowlist below): replace localhost with this Mac's IP, e.g. http://192.168.1.20:8300
 ```
 
 ### Python
 
 ```python
 import requests
-r = requests.post("http://mac.local:8300/parse/pdf",
+r = requests.post("http://localhost:8300/parse/pdf",
                   files={"file": open("scan.pdf", "rb")},
                   data={"pages": "all"})
 for page in r.json()["results"]:
@@ -169,9 +173,12 @@ boxes; strip them client-side if you only want text.
 Model selection rationale and per-variant benchmarks (mxfp8 / int8 / bf16,
 Qwen3.5 0.8B / 2B × 4-bit / 8-bit / bf16): see [MODEL_COMPARISON.md](MODEL_COMPARISON.md).
 
-## LAN access note (macOS firewall)
+## LAN access (macOS firewall)
 
-The uv-managed CPython binary is ad-hoc signed; the macOS Application Firewall
+The server binds to `localhost` by default. To serve other machines on your
+LAN, start it with `--host 0.0.0.0` — clients then use
+`http://<this-mac-ip>:8300`. Additionally, the uv-managed CPython binary is
+ad-hoc signed and the macOS Application Firewall the macOS Application Firewall
 **silently drops** inbound connections to it from other hosts (loopback still
 works, so `127.0.0.1` tests pass while LAN clients time out). Allow it once:
 

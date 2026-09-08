@@ -1,5 +1,13 @@
 # Model comparison — OCR & cleanup stages
 
+> **How to reproduce / change these configs:** the test PDF, pages, DPI list,
+> and work dir are configured in the **USER CONFIG** block at the top of
+> `scripts/compare_ocr.py` and `scripts/compare_cleanup.py` (env overrides
+> available — see [README.md](README.md#configuration) → *Configuration →
+> Benchmark scripts*). Server-side knobs (`OCR_MODEL_REF`, `OCR_CLEANUP`,
+> `OCR_CLEANUP_MODEL`, per-request `dpi` / `ocr_model`) are documented in the
+> same README section.
+
 All numbers measured on this machine (Apple M4 Max, 36 GB unified memory) with
 the harnesses in `scripts/compare_ocr.py` and `scripts/compare_cleanup.py`.
 Test document: a two-column Nature article (28 pages) with an embedded text

@@ -30,6 +30,68 @@ uv run pytest                           # API tests run against the fake engine
 First start with the real model: downloads (~3.7 GB) + weight load; allow a few
 minutes. `GET /health` shows readiness.
 
+## Configuration
+
+### Server defaults (CLI flags / env vars)
+
+```bash
+uv run ocr-server --host 0.0.0.0 --port 8300 \
+                  --model-ref sahilchachra/unlimited-ocr-mxfp8-mlx
+```
+
+| what | CLI flag | env var | default |
+|---|---|---|---|
+| Bind address | `--host` | `OCR_HOST` | `0.0.0.0` |
+| Port | `--port` | `OCR_PORT` | `8300` |
+| OCR model | `--model-ref` | `OCR_MODEL_REF` | `sahilchachra/unlimited-ocr-mxfp8-mlx` |
+| Cleanup stage | — | `OCR_CLEANUP` | `1` (set `0` to disable) |
+| Cleanup model | — | `OCR_CLEANUP_MODEL` | `mlx-community/Qwen3.5-0.8B-MLX-8bit` |
+| Stub engine (dev) | `--fake-engine` | `OCR_FAKE_ENGINE=1` | off |
+
+`--model-ref` / `OCR_MODEL_REF` accept any HF repo id or local directory
+containing an mlx-vlm model. The cleanup model only loads on first use, so
+`OCR_CLEANUP=0` also saves its memory entirely.
+
+### Per-request (multipart form fields)
+
+All fields below are optional and override the defaults above per call — see
+the API section for the full list. The two that matter most for quality/speed
+on publisher PDFs:
+
+- **`dpi`** — default **300**. Recall plateaus 150–300, but 300 is the only
+  loop-free zone for the mxfp8 OCR model on dense pages; 72 is never worth it.
+  Full DPI × quant table: [MODEL_COMPARISON.md](MODEL_COMPARISON.md).
+- **`ocr_model`** — `default` (server default model), `bf16`
+  (`mlx-community/Unlimited-OCR-bf16`: loop-free at every DPI, ~40% slower,
+  +3 GB), or any HF repo id / local path. Alternates load lazily on first use
+  and stay resident, so you can mix per batch. Rule of thumb: default for
+  everything, `bf16` for a page that came back `early_stop=true`.
+
+### Benchmark scripts (`scripts/compare_*.py`)
+
+Each script has a **USER CONFIG** block at the top with inline `<-- CHANGE`
+markers:
+
+| variable | meaning | env override (compare_ocr only) |
+|---|---|---|
+| `PDF_PATH` | test PDF with an embedded text layer | `OCR_CMP_PDF` |
+| `PAGE_NUMBERS` | pages to test (1-indexed) | `OCR_CMP_PAGES` |
+| `DPIS` | render resolutions to sweep | `OCR_CMP_DPIS` |
+| `WORK_DIR` | scratch dir for images/results | `OCR_CMP_WORKDIR` |
+
+Typical sweep (no file edits needed):
+
+```bash
+export OCR_CMP_PDF=/path/to/paper.pdf OCR_CMP_PAGES=1,2 OCR_CMP_DPIS=72,150,300
+uv run python scripts/compare_ocr.py sahilchachra/unlimited-ocr-mxfp8-mlx mxfp8
+uv run python scripts/compare_ocr.py mlx-community/Unlimited-OCR-bf16 bf16
+uv run python scripts/compare_cleanup.py mlx-community/Qwen3.5-0.8B-MLX-8bit q8
+```
+
+Run `compare_ocr.py` first — it renders pages and caches raw OCR text that
+`compare_cleanup.py` reuses. Metrics land in `WORK_DIR/ocr-cmp-<tag>.json` and
+`cleanup-cmp-<tag>.json`.
+
 ## API
 
 `GET /health` → engine status, model ref, device.
@@ -58,7 +120,7 @@ total_elapsed_s}`.
 ### Cleanup stage (default on)
 
 For PDF pages with an embedded text layer (digital-born publisher PDFs), a small
-LLM (`mlx-community/Qwen3.5-0.8B-MLX-4bit`, ~1 GB, loaded lazily on first use)
+LLM (`mlx-community/Qwen3.5-0.8B-MLX-8bit`, ~1 GB, loaded lazily on first use)
 reconciles the OCR markdown with the publisher text layer: text layer is ground
 truth for wording/numbers, OCR supplies structure. Strips `<|det|>` markers,
 fixes loop remnants, emits clean Markdown (~5-20 s/page extra). Scanned pages
@@ -75,7 +137,7 @@ Disable with `OCR_CLEANUP=0`; swap the model with `OCR_CLEANUP_MODEL=<hf-repo>`.
 ```bash
 curl -s http://mac.local:8300/health
 
-curl -s -F file=@scan.pdf -F pages=1-3,5 -F dpi=200 \
+curl -s -F file=@scan.pdf -F pages=1-3,5 \
   http://mac.local:8300/parse/pdf | jq -r '.results[].markdown' > out.md
 
 curl -s -F file=@photo.jpg http://mac.local:8300/parse/image | jq -r '.results[0].markdown'
@@ -124,8 +186,9 @@ every uv project using that interpreter.)
 ## Design notes
 
 - **PDF pipeline**: PyMuPDF renders each requested page to PNG at `dpi`
-  (150 ≈ good A4 default; 200–300 for small print), then one `generate()` call
-  per page image. Page results keep their 1-indexed page number.
+  (default 300 — the loop-free zone for quantized OCR models on dense pages),
+  then one `generate()` call per page image. Page results keep their 1-indexed
+  page number.
 - **Serialization**: model access funnels through `anyio.CapacityLimiter(1)` —
   concurrent requests queue instead of fighting over unified memory. The
   blocking MLX call runs in a worker thread so the event loop stays responsive.

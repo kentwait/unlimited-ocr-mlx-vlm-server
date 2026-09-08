@@ -2,9 +2,11 @@
 
 All numbers measured on this machine (Apple M4 Max, 36 GB unified memory) with
 the harnesses in `scripts/compare_ocr.py` and `scripts/compare_cleanup.py`.
-Test pages: **gao2026.pdf** (Nature, two-column publisher PDF) — page 1
-(title/metadata page, ~5.5k chars) and page 2 (dense two-column body text,
-~8.4k chars). Rendered at 200 dpi; gundam mode; temperature 0.
+Test document: a two-column Nature article (28 pages) with an embedded text
+layer — page 1 (title/metadata, ~5.5k chars) and page 2 (dense two-column body
+text, ~8.4k chars). Rendered at 200 dpi; gundam mode; temperature 0. Reproduce
+with `scripts/compare_ocr.py` / `scripts/compare_cleanup.py` on any
+text-layer PDF.
 
 Metrics:
 - **recall** = share of the output's word 3-grams found in the pymupdf text

@@ -38,7 +38,8 @@ minutes. `GET /health` shows readiness.
 - `file`: JPEG/PNG/WebP
 - optional: `prompt` (default `document parsing.`), `max_tokens` (default 8192),
   `temperature` (0.0), `base_size` (1024), `image_size` (640),
-  `cropping` (default true = gundam mode)
+  `cropping` (default true = gundam mode), `ocr_model` (`default` | `bf16` |
+  any HF repo id or local path — alternates lazy-load once and stay resident)
 
 `POST /parse/pdf` — multipart:
 - `file`: PDF
@@ -46,7 +47,8 @@ minutes. `GET /health` shows readiness.
 - `dpi`: render resolution, 72–300 (default 150)
 - optional OCR params as above (`cropping` defaults **true** — gundam mode;
   dense two-column publisher pages degenerate in base mode, which is only
-  faster for sparse single-column pages)
+  faster for sparse single-column pages), plus `ocr_model` — use `bf16` for
+  loop-sensitive dense batches (see `MODEL_COMPARISON.md`)
 
 Both return `{kind, n_pages, results: [{page, markdown, elapsed_s, tokens, tps,
 peak_memory_gb, early_stop, cleanup_method, cleanup_elapsed_s, cleanup_early_stop}],
@@ -101,6 +103,9 @@ for page in r.json()["results"]:
 With `<|grounding|>` the output interleaves `<|det|>...[x1,y1,x2,y2]<|/det|>`
 boxes; strip them client-side if you only want text.
 
+Model selection rationale and per-variant benchmarks (mxfp8 / int8 / bf16,
+Qwen3.5 0.8B / 2B × 4-bit / 8-bit / bf16): see [MODEL_COMPARISON.md](MODEL_COMPARISON.md).
+
 ## LAN access note (macOS firewall)
 
 The uv-managed CPython binary is ad-hoc signed; the macOS Application Firewall
@@ -132,3 +137,8 @@ every uv project using that interpreter.)
   deduped, `early_stop=true` flagged in the page result.
 - ` mlx-vlm` requires the literal `<image>` token in the prompt; the server
   inserts it via `apply_chat_template` (num_images=1) before calling `generate`.
+
+## License
+
+Apache-2.0 (see `LICENSE`). Model weights keep their own licenses —
+Unlimited-OCR: MIT (Baidu); Qwen3.5: Apache-2.0.

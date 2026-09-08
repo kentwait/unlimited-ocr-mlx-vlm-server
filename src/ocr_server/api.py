@@ -123,7 +123,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Unlimited-OCR MLX Server",
     description="LAN OCR: PDF/image -> markdown via baidu/Unlimited-OCR (MLX, Apple Silicon)",
-    version="0.2.0",
+    version="0.3.0",
     lifespan=lifespan,
 )
 

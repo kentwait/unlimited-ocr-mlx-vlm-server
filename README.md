@@ -36,7 +36,7 @@ minutes. `GET /health` shows readiness.
 
 `POST /parse/image` — multipart:
 - `file`: JPEG/PNG/WebP
-- optional: `prompt` (default `document parsing.`), `max_tokens` (default 4096),
+- optional: `prompt` (default `document parsing.`), `max_tokens` (default 8192),
   `temperature` (0.0), `base_size` (1024), `image_size` (640),
   `cropping` (default true = gundam mode)
 
@@ -44,8 +44,9 @@ minutes. `GET /health` shows readiness.
 - `file`: PDF
 - `pages`: `"all"` | `"1-3,5"` (default all; max 50 pages/request)
 - `dpi`: render resolution, 72–300 (default 150)
-- optional OCR params as above, except `cropping` defaults **false** (base mode —
-  upstream guidance for multi-page; flip to true for dense pages)
+- optional OCR params as above (`cropping` defaults **true** — gundam mode;
+  dense two-column publisher pages degenerate in base mode, which is only
+  faster for sparse single-column pages)
 
 Both return `{kind, n_pages, results: [{page, markdown, elapsed_s, tokens, tps,
 peak_memory_gb}], total_elapsed_s}`.
@@ -110,6 +111,11 @@ every uv project using that interpreter.)
   concurrent requests queue instead of fighting over unified memory. The
   blocking MLX call runs in a worker thread so the event loop stays responsive.
 - **Resolution modes**: gundam (`cropping=true`, 1024 global + 640 tiles) for
-  single images; base (`cropping=false`) for rendered PDF pages by default.
+  both single images and rendered PDF pages by default — dense academic pages
+  hallucinate in base mode (273-token global view too coarse). Base mode
+  (`cropping=false`) is the fast path for sparse single-column pages.
+- **Degenerate-loop handling**: token-tail near-periodicity check (no GPU sync)
+  breaks repetition loops early; loop tail trimmed, duplicate long lines
+  deduped, `early_stop=true` flagged in the page result.
 - ` mlx-vlm` requires the literal `<image>` token in the prompt; the server
   inserts it via `apply_chat_template` (num_images=1) before calling `generate`.

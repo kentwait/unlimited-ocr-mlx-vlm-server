@@ -30,6 +30,7 @@ from .schemas import (
     JobStatus,
     PageResult,
 )
+from .cleanup import CleanupEngine, DEFAULT_CLEANUP_MODEL
 
 log = logging.getLogger("ocr_server")
 
@@ -38,6 +39,23 @@ MAX_PAGES = 50
 ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
 ALLOWED_PDF_TYPES = {"application/pdf", "application/octet-stream"}
 TEMP_DIR = Path("/tmp/unlimited-ocr-server")
+
+_cleanup_engine: CleanupEngine | None = None
+
+
+def _get_cleanup_engine() -> CleanupEngine | None:
+    """Lazy singleton; None when disabled via env or in fake-engine mode."""
+    global _cleanup_engine
+    if holder.is_fake:
+        return None
+    enabled = os.environ.get("OCR_CLEANUP", "1").strip().lower() not in ("0", "false", "no")
+    if not enabled:
+        return None
+    if _cleanup_engine is None:
+        model = os.environ.get("OCR_CLEANUP_MODEL", DEFAULT_CLEANUP_MODEL)
+        _cleanup_engine = CleanupEngine(model)
+        log.info("cleanup model configured: %s (loads on first use)", model)
+    return _cleanup_engine
 
 
 class EngineHolder:
@@ -134,6 +152,15 @@ async def _infer_image_path(
         return await anyio.to_thread.run_sync(_run_inference_sync, path, params)
 
 
+def _run_cleanup_sync(cleanup: "CleanupEngine", ocr_text: str, text_layer: str | None):
+    return cleanup.cleanup_page(ocr_text, text_layer)
+
+
+async def _run_cleanup(cleanup: "CleanupEngine", ocr_text: str, text_layer: str | None):
+    async with infer_limiter:
+        return await anyio.to_thread.run_sync(_run_cleanup_sync, cleanup, ocr_text, text_layer)
+
+
 def _params_from_form(
     prompt: str,
     max_tokens: int,
@@ -190,25 +217,34 @@ async def _parse_pdf_path(
         except Exception as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, f"render failed: {exc}") from exc
     finally:
-        doc.close()
+        pass  # doc kept open: text layers are pulled per page during cleanup
 
+    cleanup = _get_cleanup_engine()
     results: list[PageResult] = []
     total0 = time.perf_counter()
     try:
         for page_num, img_path in zip(page_nums, rendered):
             text, stats, elapsed = await _infer_image_path(img_path, params)
-            results.append(
-                PageResult(
-                    page=page_num,
-                    markdown=text,
-                    elapsed_s=round(elapsed, 3),
-                    tokens=getattr(stats, "tokens", None),
-                    tps=round(getattr(stats, "tps", 0.0) or 0.0, 1) or None,
-                    peak_memory_gb=round(getattr(stats, "peak_memory_gb", 0.0) or 0.0, 2) or None,
-                    early_stop=bool(getattr(stats, "early_stop", False)),
-                )
+            page_res = PageResult(
+                page=page_num,
+                markdown=text,
+                elapsed_s=round(elapsed, 3),
+                tokens=getattr(stats, "tokens", None),
+                tps=round(getattr(stats, "tps", 0.0) or 0.0, 1) or None,
+                peak_memory_gb=round(getattr(stats, "peak_memory_gb", 0.0) or 0.0, 2) or None,
+                early_stop=bool(getattr(stats, "early_stop", False)),
             )
+            if cleanup is not None:
+                # Text layer of THIS page (doc still open); None -> ocr-only path.
+                text_layer = doc[page_num - 1].get_text()
+                cleaned, cstats = await _run_cleanup(cleanup, text, text_layer)
+                page_res.markdown = cleaned
+                page_res.cleanup_method = cstats.method
+                page_res.cleanup_elapsed_s = round(cstats.elapsed_s, 3)
+                page_res.cleanup_early_stop = cstats.early_stop
+            results.append(page_res)
     finally:
+        doc.close()
         shutil.rmtree(render_dir, ignore_errors=True)
 
     total_elapsed = time.perf_counter() - total0
@@ -251,6 +287,8 @@ async def parse_image(
     path = await _save_upload(file, suffix)
     try:
         text, stats, elapsed = await _infer_image_path(path, params)
+        from .cleanup import strip_det_markers
+        text = strip_det_markers(text)
     except HTTPException:
         raise
     except Exception as exc:

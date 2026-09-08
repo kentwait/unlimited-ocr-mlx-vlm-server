@@ -44,6 +44,9 @@ class PageResult(BaseModel):
     tps: float | None = None
     peak_memory_gb: float | None = None
     early_stop: bool = False  # generation loop detected and truncated
+    cleanup_method: str | None = None  # "ocr+pymupdf+llm" | "ocr-only" | None
+    cleanup_elapsed_s: float | None = None
+    cleanup_early_stop: bool | None = None
 
 
 class DocumentParseResponse(BaseModel):

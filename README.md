@@ -49,7 +49,20 @@ minutes. `GET /health` shows readiness.
   faster for sparse single-column pages)
 
 Both return `{kind, n_pages, results: [{page, markdown, elapsed_s, tokens, tps,
-peak_memory_gb}], total_elapsed_s}`.
+peak_memory_gb, early_stop, cleanup_method, cleanup_elapsed_s, cleanup_early_stop}],
+total_elapsed_s}`.
+
+### Cleanup stage (default on)
+
+For PDF pages with an embedded text layer (digital-born publisher PDFs), a small
+LLM (`mlx-community/Qwen3.5-0.8B-MLX-4bit`, ~1 GB, loaded lazily on first use)
+reconciles the OCR markdown with the publisher text layer: text layer is ground
+truth for wording/numbers, OCR supplies structure. Strips `<|det|>` markers,
+fixes loop remnants, emits clean Markdown (~5-20 s/page extra). Scanned pages
+(no text layer) and all `/parse/image` uploads get a deterministic pre-clean
+only (markers stripped, no LLM — no hallucination risk on pure-OCR input).
+
+Disable with `OCR_CLEANUP=0`; swap the model with `OCR_CLEANUP_MODEL=<hf-repo>`.
 
 `POST /parse/jobs` + `GET /parse/jobs/{job_id}` — same as `/parse/pdf` but async
 (202 + `job_id`; poll until `done`/`error`). Use for long documents.

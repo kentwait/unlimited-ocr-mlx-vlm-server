@@ -1,13 +1,14 @@
 """HTTP API: multipart endpoints for image and PDF parsing.
 
-Requests are queued through anyio.CapacityLimiter(1) so the Apple-Silicon
-MLX model gets serial access to unified memory.
+Requests are queued through anyio.CapacityLimiter(1) so the MLX model gets
+serial access to unified memory.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import platform
 import shutil
 import time
@@ -18,7 +19,7 @@ from pathlib import Path
 import anyio
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 
-from .engine import OcrEngine
+from .engine import DEFAULT_MODEL_REF, OcrEngine
 from .fake import FakeEngine
 from .pages import parse_pages_spec
 from .pdfrender import render_pdf_pages
@@ -32,7 +33,6 @@ from .schemas import (
 
 log = logging.getLogger("ocr_server")
 
-MODEL_DIR_DEFAULT = "models/Unlimited-OCR-MLX"
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024  # 200 MB
 MAX_PAGES = 50
 ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
@@ -44,29 +44,24 @@ class EngineHolder:
     def __init__(self) -> None:
         self.engine: OcrEngine | FakeEngine | None = None
         self.is_fake = False
-        self.model_dir: str | None = None
+        self.model_ref: str | None = None
 
     def load(self) -> None:
-        import os
-
-        model_dir = os.environ.get("OCR_MODEL_DIR", MODEL_DIR_DEFAULT)
-        fake = os.environ.get("OCR_FAKE_ENGINE", "").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-        )
-        self.model_dir = model_dir
+        # Read env here (not __init__) so tests/CLIs can set it after import.
+        model_ref = os.environ.get("OCR_MODEL_REF", DEFAULT_MODEL_REF)
+        fake = os.environ.get("OCR_FAKE_ENGINE", "").strip().lower() in ("1", "true", "yes")
+        self.model_ref = model_ref
         if fake:
             self.engine = FakeEngine()
             self.is_fake = True
             self.engine.load()
             log.warning("OCR_FAKE_ENGINE set — using stub engine (dev only)")
             return
-        eng = OcrEngine(model_dir)
+        eng = OcrEngine(model_ref)
         eng.load()
         self.engine = eng
         self.is_fake = False
-        log.info("Unlimited-OCR-MLX loaded from %s", model_dir)
+        log.info("mlx-vlm model loaded: %s", model_ref)
 
 
 holder = EngineHolder()
@@ -85,8 +80,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Unlimited-OCR MLX Server",
-    description="LAN OCR: PDF/image -> markdown via LoJexLLM/Unlimited-OCR-MLX (MLX, Apple Silicon)",
-    version="0.1.0",
+    description="LAN OCR: PDF/image -> markdown via baidu/Unlimited-OCR (MLX, Apple Silicon)",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
@@ -115,44 +110,46 @@ async def _save_upload(upload: UploadFile, suffix: str) -> Path:
     return path
 
 
-def _run_inference_sync(path: Path, params: InferenceParams) -> tuple[str, float]:
-    """Blocking call into the vendored engine (engine already loaded)."""
+def _run_inference_sync(path: Path, params: InferenceParams):
+    """Blocking call into the engine (engine already loaded)."""
     engine = holder.engine
     assert engine is not None, "engine not loaded"
     t0 = time.perf_counter()
-    text = engine.infer_image_file(
+    text, stats = engine.infer_image_file(
         str(path),
         prompt=params.prompt,
-        max_length=params.max_length,
+        max_tokens=params.max_tokens,
         temperature=params.temperature,
         base_size=params.base_size,
         image_size=params.image_size,
-        crop_mode=params.crop_mode,
+        cropping=params.cropping,
     )
-    return text, time.perf_counter() - t0
+    return text, stats, time.perf_counter() - t0
 
 
-async def _infer_image_path(path: Path, params: InferenceParams) -> tuple[str, float]:
+async def _infer_image_path(
+    path: Path, params: InferenceParams
+) -> tuple[str, object, float]:
     async with infer_limiter:
         return await anyio.to_thread.run_sync(_run_inference_sync, path, params)
 
 
 def _params_from_form(
     prompt: str,
-    max_length: int,
+    max_tokens: int,
     temperature: float,
     base_size: int,
     image_size: int,
-    crop_mode: bool,
+    cropping: bool,
 ) -> InferenceParams:
     try:
         return InferenceParams(
             prompt=prompt,
-            max_length=max_length,
+            max_tokens=max_tokens,
             temperature=temperature,
             base_size=base_size,
             image_size=image_size,
-            crop_mode=crop_mode,
+            cropping=cropping,
         )
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
@@ -199,9 +196,16 @@ async def _parse_pdf_path(
     total0 = time.perf_counter()
     try:
         for page_num, img_path in zip(page_nums, rendered):
-            text, elapsed = await _infer_image_path(img_path, params)
+            text, stats, elapsed = await _infer_image_path(img_path, params)
             results.append(
-                PageResult(page=page_num, markdown=text, elapsed_s=round(elapsed, 3))
+                PageResult(
+                    page=page_num,
+                    markdown=text,
+                    elapsed_s=round(elapsed, 3),
+                    tokens=getattr(stats, "tokens", None),
+                    tps=round(getattr(stats, "tps", 0.0) or 0.0, 1) or None,
+                    peak_memory_gb=round(getattr(stats, "peak_memory_gb", 0.0) or 0.0, 2) or None,
+                )
             )
     finally:
         shutil.rmtree(render_dir, ignore_errors=True)
@@ -221,7 +225,7 @@ async def health() -> HealthResponse:
         status="ok" if holder.engine is not None else "loading",
         engine="fake" if holder.is_fake else "real",
         model_loaded=holder.engine is not None and holder.engine.loaded,
-        model_dir=holder.model_dir,
+        model_ref=holder.model_ref,
         device=f"apple-silicon ({platform.machine()})",
     )
 
@@ -234,18 +238,18 @@ async def health() -> HealthResponse:
 async def parse_image(
     file: UploadFile = File(...),
     prompt: str = Form("document parsing."),
-    max_length: int = Form(32768),
+    max_tokens: int = Form(4096),
     temperature: float = Form(0.0),
     base_size: int = Form(1024),
     image_size: int = Form(640),
-    crop_mode: bool = Form(True),
+    cropping: bool = Form(True),
 ) -> DocumentParseResponse:
-    """Parse one image (JPEG/PNG/WebP) to markdown/text."""
-    params = _params_from_form(prompt, max_length, temperature, base_size, image_size, crop_mode)
+    """Parse one image (JPEG/PNG/WebP) to markdown/text (gundam mode default)."""
+    params = _params_from_form(prompt, max_tokens, temperature, base_size, image_size, cropping)
     suffix = Path(file.filename or "x.jpg").suffix.lower() or ".png"
     path = await _save_upload(file, suffix)
     try:
-        text, elapsed = await _infer_image_path(path, params)
+        text, stats, elapsed = await _infer_image_path(path, params)
     except HTTPException:
         raise
     except Exception as exc:
@@ -259,7 +263,16 @@ async def parse_image(
     return DocumentParseResponse(
         kind="image",
         n_pages=1,
-        results=[PageResult(page=1, markdown=text, elapsed_s=round(elapsed, 3))],
+        results=[
+            PageResult(
+                page=1,
+                markdown=text,
+                elapsed_s=round(elapsed, 3),
+                tokens=getattr(stats, "tokens", None),
+                tps=round(getattr(stats, "tps", 0.0) or 0.0, 1) or None,
+                peak_memory_gb=round(getattr(stats, "peak_memory_gb", 0.0) or 0.0, 2) or None,
+            )
+        ],
         total_elapsed_s=round(elapsed, 3),
     )
 
@@ -274,14 +287,18 @@ async def parse_pdf(
     pages: str = Form("all"),
     dpi: int = Form(150),
     prompt: str = Form("document parsing."),
-    max_length: int = Form(32768),
+    max_tokens: int = Form(4096),
     temperature: float = Form(0.0),
     base_size: int = Form(1024),
     image_size: int = Form(640),
-    crop_mode: bool = Form(False),
+    cropping: bool = Form(False),
 ) -> DocumentParseResponse:
-    """Parse a PDF to markdown. `pages` = "all" | "1-3,5". One OCR call per page."""
-    params = _params_from_form(prompt, max_length, temperature, base_size, image_size, crop_mode)
+    """Parse a PDF to markdown. `pages` = "all" | "1-3,5". One OCR call per page.
+
+    PDF pages default to base mode (cropping=false) per upstream guidance for
+    multi-page workflows; pass cropping=true for dense single pages.
+    """
+    params = _params_from_form(prompt, max_tokens, temperature, base_size, image_size, cropping)
     path = await _save_upload(file, ".pdf")
     try:
         return await _parse_pdf_path(path, pages=pages, dpi=dpi, params=params)
@@ -295,14 +312,14 @@ async def parse_pdf_async(
     pages: str = Form("all"),
     dpi: int = Form(150),
     prompt: str = Form("document parsing."),
-    max_length: int = Form(32768),
+    max_tokens: int = Form(4096),
     temperature: float = Form(0.0),
     base_size: int = Form(1024),
     image_size: int = Form(640),
-    crop_mode: bool = Form(False),
+    cropping: bool = Form(False),
 ) -> JobStatus:
     """Submit a PDF parse as a background job (returns immediately with job_id)."""
-    params = _params_from_form(prompt, max_length, temperature, base_size, image_size, crop_mode)
+    params = _params_from_form(prompt, max_tokens, temperature, base_size, image_size, cropping)
     path = await _save_upload(file, ".pdf")
     job_id = uuid.uuid4().hex[:12]
     job = JobStatus(

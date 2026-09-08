@@ -16,9 +16,8 @@ dependencies = [
     "pymupdf>=1.24.0",
     "mlx>=0.20.0",
     "safetensors>=0.4.0",
-    "torch>=2.0.0",
     "transformers>=4.45.0",
-    "sentencepiece>=0.2.0",
+    "mlx-vlm>=0.7.0",
 ]
 
 [dependency-groups]

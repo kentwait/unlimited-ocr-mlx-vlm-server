@@ -1,49 +1,57 @@
 # unlimited-ocr-server
 
-LAN-accessible FastAPI server that wraps [LoJexLLM/Unlimited-OCR-MLX](https://huggingface.co/LoJexLLM/Unlimited-OCR-MLX)
-(MLX port of Baidu's Unlimited-OCR, DeepSeek-OCR lineage) and serves
+LAN-accessible FastAPI server wrapping **baidu/Unlimited-OCR** (DeepSeek-OCR
+lineage) as quantized by [sahilchachra/unlimited-ocr-mxfp8-mlx](https://huggingface.co/sahilchachra/unlimited-ocr-mxfp8-mlx)
+(block-float MXFP8, ~3.7 GB on disk, ~5 GB peak memory). Serves
 **PDF → markdown** (per-page) and **image → markdown** over multipart HTTP.
-Apple Silicon only (MLX).
+Runs the model through [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) on Apple
+Silicon.
 
-The upstream repo is vendored as a git **submodule** (`vendor/Unlimited-OCR-MLX`).
-Its 6.7 GB weights are *not* in the submodule (git-lfs) — download them separately
-into `models/Unlimited-OCR-MLX/` (default, git-ignored).
+No vendored model code — the server depends on the `mlx-vlm` package, which
+natively supports this architecture (`model_type: "deepseekocr"`, config
+already patched upstream).
 
 ## Setup
 
 ```bash
-uv sync                      # creates .venv, resolves deps (Py3.10+, Apple Silicon)
-git submodule update --init  # vendor code (if you cloned fresh)
-uv run scripts/download_model.py    # ~6.7 GB -> models/Unlimited-OCR-MLX/
+uv sync                                # deps (Py3.10+, Apple Silicon)
+uv run python scripts/download_model.py   # optional; first server start downloads anyway
 ```
 
 ## Run
 
 ```bash
-uv run ocr-server                     # 0.0.0.0:8300, model on startup (first load is slow)
-uv run ocr-server --port 8301 --model-dir /path/to/Unlimited-OCR-MLX
-uv run ocr-server --fake-engine       # no model; stub responses for client dev
-uv run pytest                         # API tests run against the fake engine
+uv run ocr-server                       # 0.0.0.0:8300, model loads on startup
+uv run ocr-server --port 8301 --model-ref /path/to/local/model
+uv run ocr-server --fake-engine         # no model; stub responses for client dev
+uv run pytest                           # API tests run against the fake engine
 ```
+
+First start with the real model: downloads (~3.7 GB) + weight load; allow a few
+minutes. `GET /health` shows readiness.
 
 ## API
 
-`GET /health` → engine status, model dir, device.
+`GET /health` → engine status, model ref, device.
 
 `POST /parse/image` — multipart:
 - `file`: JPEG/PNG/WebP
-- optional: `prompt` (default `document parsing.`), `max_length`, `temperature`, `base_size`, `image_size`, `crop_mode` (default true = gundam/dynamic-tiling)
+- optional: `prompt` (default `document parsing.`), `max_tokens` (default 4096),
+  `temperature` (0.0), `base_size` (1024), `image_size` (640),
+  `cropping` (default true = gundam mode)
 
 `POST /parse/pdf` — multipart:
 - `file`: PDF
 - `pages`: `"all"` | `"1-3,5"` (default all; max 50 pages/request)
 - `dpi`: render resolution, 72–300 (default 150)
-- optional OCR params as above, except `crop_mode` defaults **false** (base mode — upstream guidance for multi-page)
+- optional OCR params as above, except `cropping` defaults **false** (base mode —
+  upstream guidance for multi-page; flip to true for dense pages)
 
-Both return `{kind, n_pages, results: [{page, markdown, elapsed_s, ...}], total_elapsed_s}`.
+Both return `{kind, n_pages, results: [{page, markdown, elapsed_s, tokens, tps,
+peak_memory_gb}], total_elapsed_s}`.
 
 `POST /parse/jobs` + `GET /parse/jobs/{job_id}` — same as `/parse/pdf` but async
-(202 + `job_id`; poll status until `done`/`error`). Useful for long documents.
+(202 + `job_id`; poll until `done`/`error`). Use for long documents.
 
 ### curl
 
@@ -67,6 +75,18 @@ for page in r.json()["results"]:
     print(page["page"], page["markdown"])
 ```
 
+## Prompts (DeepSeek-OCR vocabulary)
+
+| Task | Prompt |
+|---|---|
+| Document → Markdown (native parse) | `document parsing.` *(default)* |
+| Plain text OCR, no layout | `Free OCR.` |
+| OCR + bounding boxes | `<|grounding|>Convert the document to markdown.` |
+| Parse a figure/chart | `Parse the figure.` |
+
+With `<|grounding|>` the output interleaves `<|det|>...[x1,y1,x2,y2]<|/det|>`
+boxes; strip them client-side if you only want text.
+
 ## LAN access note (macOS firewall)
 
 The uv-managed CPython binary is ad-hoc signed; the macOS Application Firewall
@@ -83,18 +103,13 @@ every uv project using that interpreter.)
 
 ## Design notes
 
-- **Submodule**: `vendor/Unlimited-OCR-MLX` is a *flat* package (package files at
-  repo root, dashes in the dir name) — `ocr_server.engine` registers it as the
-  importable package `unlimited_ocr_mlx` via importlib.
 - **PDF pipeline**: PyMuPDF renders each requested page to PNG at `dpi`
-  (150 ≈ good default for A4; 200–300 for small print), then one
-  `infer_single()` call per page image. Page results keep their 1-indexed page number.
-- **Serialization**: model access is funneled through `anyio.CapacityLimiter(1)` —
-  concurrent requests queue instead of corrupting GPU memory. The blocking MLX
-  call runs in a worker thread so the event loop stays responsive.
-- **Defaults follow upstream docs**: temperature 0, max_length 32768, gundam mode
-  (`crop_mode=True, base_size=1024, image_size=640`) for single images, base mode
-  (`crop_mode=False, image_size=1024`) for PDF pages.
-- **Upstream quirks**: output text contains layout tags like `<|det|>...<|/det|>`
-  and `<PAGE>` markers; strip downstream if you want pure markdown. The engine
-  prints progress to stdout; server logs are separate.
+  (150 ≈ good A4 default; 200–300 for small print), then one `generate()` call
+  per page image. Page results keep their 1-indexed page number.
+- **Serialization**: model access funnels through `anyio.CapacityLimiter(1)` —
+  concurrent requests queue instead of fighting over unified memory. The
+  blocking MLX call runs in a worker thread so the event loop stays responsive.
+- **Resolution modes**: gundam (`cropping=true`, 1024 global + 640 tiles) for
+  single images; base (`cropping=false`) for rendered PDF pages by default.
+- ` mlx-vlm` requires the literal `<image>` token in the prompt; the server
+  inserts it via `apply_chat_template` (num_images=1) before calling `generate`.

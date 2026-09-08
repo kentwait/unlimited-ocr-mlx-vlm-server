@@ -13,9 +13,9 @@ def main() -> None:
     parser.add_argument("--host", default=os.environ.get("OCR_HOST", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("OCR_PORT", "8300")))
     parser.add_argument(
-        "--model-dir",
-        default=os.environ.get("OCR_MODEL_DIR", "models/Unlimited-OCR-MLX"),
-        help="Directory with model.safetensors + config.json + tokenizer",
+        "--model-ref",
+        default=os.environ.get("OCR_MODEL_REF", "sahilchachra/unlimited-ocr-mxfp8-mlx"),
+        help="HF repo id or local path of the MLX model",
     )
     parser.add_argument(
         "--fake-engine",
@@ -24,7 +24,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    os.environ["OCR_MODEL_DIR"] = args.model_dir
+    os.environ["OCR_MODEL_REF"] = args.model_ref
     if args.fake_engine:
         os.environ["OCR_FAKE_ENGINE"] = "1"
 

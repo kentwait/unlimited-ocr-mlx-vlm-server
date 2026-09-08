@@ -1,33 +1,26 @@
-"""Download the MLX weights into models/Unlimited-OCR-MLX via huggingface_hub."""
+"""Optional: prefetch the model into the local HF cache (~3.7 GB).
+
+The server loads by HF repo id by default and will download on first start;
+this script just does it ahead of time.
+"""
 
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 
 from huggingface_hub import snapshot_download
 
-REPO_ID = "LoJexLLM/Unlimited-OCR-MLX"
-# Skip the git-lfs pointer noise; we only need the actual weight/config files.
-IGNORE = ["*.md", ".gitattributes"]
+DEFAULT_REPO = "sahilchachra/unlimited-ocr-mxfp8-mlx"
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--dest",
-        default="models/Unlimited-OCR-MLX",
-        help="Target directory (default: models/Unlimited-OCR-MLX)",
-    )
+    parser.add_argument("--repo", default=DEFAULT_REPO)
+    parser.add_argument("--local-dir", default=None, help="Also copy into this dir")
     args = parser.parse_args()
 
-    dest = Path(args.dest).expanduser().resolve()
-    print(f"Downloading {REPO_ID} -> {dest} (~6.7 GB)")
-    snapshot_download(
-        repo_id=REPO_ID,
-        local_dir=str(dest),
-        ignore_patterns=IGNORE,
-    )
+    print(f"Downloading {args.repo} (~3.7 GB) into the HF cache")
+    snapshot_download(repo_id=args.repo, local_dir=args.local_dir)
     print("Done.")
 
 

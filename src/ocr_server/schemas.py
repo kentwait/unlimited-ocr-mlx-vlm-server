@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -13,16 +12,16 @@ ALLOWED_PROMPT_RE = re.compile(
 
 
 class InferenceParams(BaseModel):
-    """OCR parameters accepted by every endpoint (matches vendor infer_single)."""
+    """OCR parameters accepted by every endpoint (passed to mlx_vlm.generate)."""
 
     model_config = {"protected_namespaces": ()}
 
     prompt: str = "document parsing."
-    max_length: int = Field(default=32768, ge=16, le=32768)
+    max_tokens: int = Field(default=4096, ge=16, le=32768)
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     base_size: int = Field(default=1024, ge=256, le=2048)
     image_size: int = Field(default=640, ge=256, le=2048)
-    crop_mode: bool = True
+    cropping: bool = True
 
     @field_validator("prompt")
     @classmethod
@@ -43,10 +42,11 @@ class PageResult(BaseModel):
     elapsed_s: float
     tokens: int | None = None
     tps: float | None = None
+    peak_memory_gb: float | None = None
 
 
 class DocumentParseResponse(BaseModel):
-    kind: Literal["pdf", "image"]
+    kind: str  # "pdf" | "image"
     n_pages: int
     results: list[PageResult]
     total_elapsed_s: float
@@ -56,14 +56,14 @@ class HealthResponse(BaseModel):
     status: str
     engine: str  # "real" | "fake"
     model_loaded: bool
-    model_dir: str | None = None
+    model_ref: str | None = None
     device: str
 
 
 class JobStatus(BaseModel):
     job_id: str
-    status: Literal["pending", "running", "done", "error"]
-    kind: Literal["pdf", "image"] | None = None
+    status: str  # pending | running | done | error
+    kind: str | None = None
     filename: str | None = None
     error: str | None = None
     result: DocumentParseResponse | None = None

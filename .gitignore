@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# Model weights (6.7 GB — fetched via scripts/download_model.py)
+models/
+
+# Local scratch
+output/
+*.log
+.DS_Store

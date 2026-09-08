@@ -1,0 +1,3 @@
+[submodule "vendor/Unlimited-OCR-MLX"]
+	path = vendor/Unlimited-OCR-MLX
+	url = https://huggingface.co/LoJexLLM/Unlimited-OCR-MLX

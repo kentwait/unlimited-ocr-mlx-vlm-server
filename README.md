@@ -115,18 +115,30 @@ Run `compare_ocr.py` first — it renders pages and caches raw OCR text that
   loop-sensitive dense batches (see `MODEL_COMPARISON.md`)
 
 Both return `{kind, n_pages, results: [{page, markdown, elapsed_s, tokens, tps,
-peak_memory_gb, early_stop, cleanup_method, cleanup_elapsed_s, cleanup_early_stop}],
-total_elapsed_s}`.
+peak_memory_gb, early_stop, cleanup_method, cleanup_elapsed_s, cleanup_early_stop,
+corrections, spans_jsonl}], total_elapsed_s}`.
 
-### Cleanup stage (default on)
+- **`spans_jsonl`** — the structured OCR intermediate: one JSON record per
+  detected span, `{"page", "label" (title/text/image/…), "box" ([x1,y1,x2,y2]
+  in the model's 0–1000 space), "text"}`. Markdown is rendered deterministically
+  from these spans; consume the JSONL directly if you want boxes/labels.
+- **`corrections`** — what the checker changed, content vs formatting:
+  `{text_layer_backed, ocr_vocab_backed, invented, formatting_only,
+  format_added_words, format_removed_words, samples_invented,
+  samples_text_layer_backed}`. Content edits are word-level changes; `invented`
+  = words with no source in the text layer or OCR output (model intuition —
+  audit these). Formatting is markdown-transform churn, counted but not
+  attributed.
 
-For PDF pages with an embedded text layer (digital-born publisher PDFs), a small
-LLM (`mlx-community/Qwen3.5-0.8B-MLX-8bit`, ~1 GB, loaded lazily on first use)
-reconciles the OCR markdown with the publisher text layer: text layer is ground
-truth for wording/numbers, OCR supplies structure. Strips `<|det|>` markers,
-fixes loop remnants, emits clean Markdown (~5-20 s/page extra). Scanned pages
-(no text layer) and all `/parse/image` uploads get a deterministic pre-clean
-only (markers stripped, no LLM — no hallucination risk on pure-OCR input).
+### Checker stage (default on)
+
+All pages get the checker LLM. Digital pages: reconcile with the text layer
+(ground truth for wording/numbers) + proofread. Scanned pages (no text layer):
+proofread-only prompt — fix obvious OCR misspellings from context, never
+paraphrase; every edit is attributed in `corrections` and logged at INFO
+(`OCR_LOG_LEVEL` env var controls the level), so hallucination risk stays
+visible. Strips `<|det|>` markers, fixes loop remnants, emits clean Markdown
+(~5-20 s/page extra).
 
 Disable with `OCR_CLEANUP=0`; swap the model with `OCR_CLEANUP_MODEL=<hf-repo>`.
 

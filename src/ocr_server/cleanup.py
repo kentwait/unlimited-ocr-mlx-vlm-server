@@ -3,29 +3,41 @@
 Pipeline per page:
   1. deterministic pre-clean of OCR markdown (strip <|det|> markers/coords,
      drop empty det-only lines, dedupe loop-remnant lines)
-  2. if the PDF page has a usable text layer (digital-born page), a small LLM
-     (Qwen3.5-0.8B MLX 4-bit via mlx_vlm) reconciles OCR structure with the
-     publisher text layer and emits clean Markdown
+  2. LLM stage (Qwen3.5-0.8B MLX 8-bit via mlx_vlm):
+     - digital pages (text layer >= 200 chars): reconcile OCR structure with
+       the publisher text layer AND proofread (misspellings etc.)
+     - scanned pages: proofread-only prompt — fix obvious OCR misspellings
+       from context; never paraphrase; preserve names/numbers/units
   3. token-level loop-break (same detector as OCR stage) + long-line dedupe
 
-The LLM only runs when a text layer exists — it is the ground truth for
-wording; without it (scanned pages) the LLM would be free to "correct" real
-OCR text into plausible hallucinations, so those pages get step 1 only.
+Every LLM edit is audited: the checker's input is word-diffed against its
+output, and each changed word is attributed as
+  - text-layer-backed: the replacement exists in the page's text layer
+  - ocr-vocab-backed:  replacement appears elsewhere in the page's own OCR
+  - invented:          replacement exists in neither (model "intuition") —
+                       the hallucination-risk category, surfaced in logs
+Corrections are logged at INFO per page and summarized in CleanupStats.
 """
 
 from __future__ import annotations
 
+import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .engine import _dedupe_long_lines, _loop_period
+from .spans import parse_spans, render_markdown, spans_to_jsonl
+
+log = logging.getLogger("ocr_server")
 
 DEFAULT_CLEANUP_MODEL = "mlx-community/Qwen3.5-0.8B-MLX-8bit"
 
 _DET_RE = re.compile(r"<\|det\|>[^<]*<\|/det\|>")
 _LEFTOVER_BRACKET_RE = re.compile(r"^\s*\[?\d+,\s*\d+(,\s*\d+)*\]?\s*$")
 _MULTIBLANK_RE = re.compile(r"\n{3,}")
+_WORD_RE = re.compile(r"\w+", re.UNICODE)
+_MARKDOWN_RE = re.compile(r"[#*_>`\[\]()\\|⁰¹²³⁴⁵⁶⁷⁸⁹₀₁₂₃₄₅₆₇₈₉]")
 
 
 def strip_det_markers(ocr_text: str) -> str:
@@ -44,16 +56,146 @@ def strip_det_markers(ocr_text: str) -> str:
     return _dedupe_long_lines(cleaned).strip()
 
 
+# ---------------------------------------------------------------------------
+# Correction auditing (word-level diff with attribution)
+# ---------------------------------------------------------------------------
+
+def _norm_word(w: str) -> str:
+    """Loose word key for vocabulary checks: lowercase, markdown stripped,
+    superscript/subscript unicode folded to ascii digits."""
+    w = _MARKDOWN_RE.sub("", w)
+    w = w.translate(_SUP_MAP)
+    return w.lower()
+
+
+_SUP_MAP = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹", "0123456789")
+_SUPERSCRIPT_RE = re.compile("[⁰¹²³⁴⁵⁶⁷⁸⁹₀₁₂₃₄₅₆₇₈₉]")
+
+# Words whose presence differs only because of markdown transformation
+# (superscripts, citations, urls split/join) — formatting, not content.
+_FORMAT_WORD_RE = re.compile(r"^(?:\d+[.,]?\d*|[a-z])$", re.IGNORECASE)
+
+
+def _content_words(text: str) -> list[str]:
+    """Normalized content words for the content-edit diff."""
+    return [
+        w
+        for w in (_norm_word(x) for x in _WORD_RE.findall(text))
+        if len(w) >= 2 and not w.isdigit()
+    ]
+
+
+@dataclass
+class CorrectionAudit:
+    """Diff between the checker's input and output, split into:
+
+    - content edits: word-level changes (the misspellings/hallucinations)
+      attributed to text-layer / OCR vocabulary / invented
+    - formatting: markdown-transform churn, reported as counts only
+    """
+
+    n_words_in: int = 0
+    n_words_out: int = 0
+    text_layer_backed: list[str] = field(default_factory=list)
+    ocr_vocab_backed: list[str] = field(default_factory=list)
+    invented: list[str] = field(default_factory=list)
+    formatting_only: bool = False
+    format_removed_words: int = 0
+    format_added_words: int = 0
+
+    @property
+    def n_edits(self) -> int:
+        return (
+            len(self.text_layer_backed)
+            + len(self.ocr_vocab_backed)
+            + len(self.invented)
+        )
+
+    def log_summary(self, page_label: str) -> None:
+        if self.formatting_only:
+            log.info(
+                "%s: checker formatting-only (%d -> %d content words, "
+                "+%d/-%d markdown-structure words) — no content edits",
+                page_label,
+                self.n_words_in,
+                self.n_words_out,
+                self.format_added_words,
+                self.format_removed_words,
+            )
+            return
+        if self.n_edits == 0:
+            log.info("%s: checker made no content edits", page_label)
+            return
+        samples = lambda xs: ", ".join(repr(x) for x in xs[:6]) + (
+            f" …(+{len(xs) - 6})" if len(xs) > 6 else ""
+        )
+        log.info(
+            "%s: checker CONTENT edits — %d | text-layer-backed: %s | "
+            "ocr-vocab-backed: %s | INVENTED (no source): %s",
+            page_label,
+            self.n_edits,
+            samples(self.text_layer_backed) or "none",
+            samples(self.ocr_vocab_backed) or "none",
+            samples(self.invented) or "none",
+        )
+
+
+def audit_corrections(
+    before: str, after: str, text_layer: str | None
+) -> CorrectionAudit:
+    """Content-edit diff between checker input and output.
+
+    Works on normalized *content word multisets* (order-independent, so
+    markdown reflow doesn't produce phantom edits): counts words removed from
+    and added to the page, then attributes each added word against the
+    text-layer vocabulary and the page's own OCR vocabulary.
+    """
+    from collections import Counter
+
+    audit = CorrectionAudit()
+    b = _content_words(before)
+    a = _content_words(after)
+    audit.n_words_in = len(b)
+    audit.n_words_out = len(a)
+    tl_vocab = {_norm_word(w) for w in _WORD_RE.findall(text_layer or "")}
+    ocr_vocab = set(Counter(b))
+
+    removed = Counter(b) - Counter(a)  # words dropped by the checker
+    added = Counter(a) - Counter(b)  # words introduced by the checker
+    audit.format_removed_words = sum(removed.values())
+    audit.format_added_words = sum(added.values())
+
+    # Nothing meaningfully removed => output kept the page's words: any added
+    # words are format-adjacent; anything else would have shown up as removals.
+    audit.formatting_only = not removed and not added
+    for w, n in added.items():
+        for _ in range(n):
+            if w in tl_vocab:
+                audit.text_layer_backed.append(w)
+            elif w in ocr_vocab:
+                audit.ocr_vocab_backed.append(w)
+            else:
+                audit.invented.append(w)
+    return audit
+
+
+# ---------------------------------------------------------------------------
+# Cleanup engine
+# ---------------------------------------------------------------------------
+
 @dataclass
 class CleanupStats:
-    method: str  # "ocr+pymupdf+llm" | "ocr-only"
+    method: str  # "ocr+pymupdf+llm" | "ocr-llm-proofread" | "ocr-only"
     elapsed_s: float
     tokens: int | None = None
     early_stop: bool = False
+    audit: CorrectionAudit | None = None
+    spans_jsonl: str | None = None  # structured span intermediate (JSONL)
 
 
 class CleanupEngine:
-    """Lazy-loaded small LLM that merges OCR structure with the text layer."""
+    """Lazy-loaded small LLM that merges OCR structure with the text layer
+    and proofreads the result."""
 
     def __init__(self, model_ref: str = DEFAULT_CLEANUP_MODEL):
         self.model_ref = model_ref
@@ -102,18 +244,7 @@ class CleanupEngine:
         text = _dedupe_long_lines(text)
         return text, len(ids), early_stop
 
-    def cleanup_page(
-        self, ocr_text: str, text_layer: str | None, max_tokens: int = 6144
-    ) -> tuple[str, CleanupStats]:
-        import time as _time
-
-        t0 = _time.perf_counter()
-        pre = strip_det_markers(ocr_text)
-        if not text_layer or len(text_layer.strip()) < 200:
-            return pre, CleanupStats(method="ocr-only", elapsed_s=_time.perf_counter() - t0)
-
-        self.load()
-        prompt = f"""You are cleaning OCR output of one page of an academic paper.
+    _DIGITAL_PROMPT = """You are cleaning OCR output of one page of an academic paper.
 
 OCR MARKDOWN (structure hints; may contain garbled or repeated fragments):
 <<<OCR
@@ -122,22 +253,58 @@ OCR>>>
 
 PDF TEXT LAYER (exact words from the publisher, ground truth for wording and numbers; reading order may differ):
 <<<TEXT
-{text_layer.strip()}
+{text_layer}
 TEXT>>>
 
-TASK: Produce clean Markdown of the page. The PDF text layer is the source of truth for wording and numbers; use the OCR for structure (headings, figure placement) and for anything missing from the text layer. Keep section headings as Markdown headings. Do not invent content. Output ONLY the Markdown."""
+TASK: Produce clean Markdown of the page. The PDF text layer is the source of truth for wording and numbers; use the OCR for structure (headings, figure placement) and for anything missing from the text layer. Also fix OCR misspellings using the text layer. Keep section headings as Markdown headings. Do not invent content. Output ONLY the Markdown."""
+
+    _SCAN_PROMPT = """You are proofreading OCR output of one page of a scanned document.
+
+OCR MARKDOWN:
+<<<OCR
+{pre}
+OCR>>>
+
+TASK: Produce clean Markdown of the page. Fix obvious OCR misspellings and garbled words using context (e.g. "inf1ammation" -> "inflammation", "teh" -> "the"). Keep all wording, names, numbers, and units exactly as recognized — never paraphrase, summarize, or add content. If a word is unrecognizable, keep it as-is. Keep section headings as Markdown headings. Output ONLY the Markdown."""
+
+    def cleanup_page(
+        self, ocr_text: str, text_layer: str | None, max_tokens: int = 6144
+    ) -> tuple[str, CleanupStats]:
+        """Check/clean one page. Returns (markdown, stats); stats.spans_jsonl
+        carries the structured span intermediate (see ocr_server.spans)."""
+        import time as _time
+
+        t0 = _time.perf_counter()
+        spans = parse_spans(ocr_text)
+        spans_jsonl = spans_to_jsonl(spans)
+        pre = render_markdown(spans)
+
+        has_text_layer = bool(text_layer) and len(text_layer.strip()) >= 200
+        if has_text_layer:
+            method = "ocr+pymupdf+llm"
+            prompt = self._DIGITAL_PROMPT.format(pre=pre, text_layer=(text_layer or "").strip())
+        else:
+            method = "ocr-llm-proofread"
+            prompt = self._SCAN_PROMPT.format(pre=pre)
+
+        self.load()
         text, n_tokens, early_stop = self._generate(prompt, max_tokens)
-        # Guard against empty/degenerate output: fall back to pre-cleaned OCR.
+        audit = audit_corrections(pre, text, text_layer if has_text_layer else None)
+
+        # Degenerate output -> fall back to the deterministic markdown render.
         if len(text) < 0.3 * len(pre):
-            return pre, CleanupStats(
-                method="ocr+pymupdf+llm",
-                elapsed_s=_time.perf_counter() - t0,
-                tokens=n_tokens,
-                early_stop=early_stop,
+            log.warning(
+                "checker output degenerate (%d chars < 30%% of input); "
+                "falling back to deterministic markdown",
+                len(text),
             )
+            text = pre
+
         return text, CleanupStats(
-            method="ocr+pymupdf+llm",
+            method=method,
             elapsed_s=_time.perf_counter() - t0,
             tokens=n_tokens,
             early_stop=early_stop,
+            audit=audit,
+            spans_jsonl=spans_jsonl,
         )

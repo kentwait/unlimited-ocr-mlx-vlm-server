@@ -44,9 +44,11 @@ class PageResult(BaseModel):
     tps: float | None = None
     peak_memory_gb: float | None = None
     early_stop: bool = False  # generation loop detected and truncated
-    cleanup_method: str | None = None  # "ocr+pymupdf+llm" | "ocr-only" | None
+    cleanup_method: str | None = None  # "ocr+pymupdf+llm" | "ocr-llm-proofread" | "ocr-only"
     cleanup_elapsed_s: float | None = None
     cleanup_early_stop: bool | None = None
+    corrections: dict | None = None  # checker edit counts + samples (see audit_corrections)
+    spans_jsonl: str | None = None  # structured OCR spans: {"page", "label", "box", "text"} per line
 
 
 class DocumentParseResponse(BaseModel):

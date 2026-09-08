@@ -268,18 +268,63 @@ async def _parse_pdf_path(
                 page_res.cleanup_method = cstats.method
                 page_res.cleanup_elapsed_s = round(cstats.elapsed_s, 3)
                 page_res.cleanup_early_stop = cstats.early_stop
+                audit = cstats.audit
+                if audit is not None:
+                    audit.log_summary(f"page {page_num}")
+                    page_res.corrections = {
+                        "text_layer_backed": len(audit.text_layer_backed),
+                        "ocr_vocab_backed": len(audit.ocr_vocab_backed),
+                        "invented": len(audit.invented),
+                        "formatting_only": audit.formatting_only,
+                        "format_added_words": audit.format_added_words,
+                        "format_removed_words": audit.format_removed_words,
+                        "samples_invented": audit.invented[:8],
+                        "samples_text_layer_backed": audit.text_layer_backed[:8],
+                    }
+                page_res.spans_jsonl = cstats.spans_jsonl
+            log.info(
+                "page %d/%d done: ocr %.1fs (%d tok%s), cleanup %s %.1fs, %d chars",
+                page_num,
+                len(page_nums),
+                elapsed,
+                getattr(stats, "tokens", 0) or 0,
+                ", early-stop" if getattr(stats, "early_stop", False) else "",
+                page_res.cleanup_method or "off",
+                page_res.cleanup_elapsed_s or 0.0,
+                len(page_res.markdown),
+            )
             results.append(page_res)
     finally:
         doc.close()
         shutil.rmtree(render_dir, ignore_errors=True)
 
     total_elapsed = time.perf_counter() - total0
-    return DocumentParseResponse(
+    resp = DocumentParseResponse(
         kind="pdf",
         n_pages=len(results),
         results=results,
         total_elapsed_s=round(total_elapsed, 3),
     )
+    # Response summary: aggregate correction stats across pages.
+    tot_edits = sum(
+        (r.corrections or {}).get("text_layer_backed", 0)
+        + (r.corrections or {}).get("ocr_vocab_backed", 0)
+        + (r.corrections or {}).get("invented", 0)
+        for r in results
+    )
+    tot_inv = sum((r.corrections or {}).get("invented", 0) for r in results)
+    log.info(
+        "request summary: %d pages in %.1fs (%.1f s/page avg) | checker edits: %d "
+        "total, %d invented | ocr_model=%s dpi=%d",
+        len(results),
+        total_elapsed,
+        total_elapsed / max(1, len(results)),
+        tot_edits,
+        tot_inv,
+        ocr_model or "default",
+        dpi,
+    )
+    return resp
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -315,8 +360,6 @@ async def parse_image(
     try:
         engine = holder.get_ocr_engine(ocr_model)
         text, stats, elapsed = await _infer_image_path(path, params, engine)
-        from .cleanup import strip_det_markers
-        text = strip_det_markers(text)
     except HTTPException:
         raise
     except Exception as exc:
@@ -326,6 +369,43 @@ async def parse_image(
         ) from exc
     finally:
         path.unlink(missing_ok=True)
+
+    cleanup = _get_cleanup_engine()
+    cleanup_method = None
+    cleanup_elapsed = None
+    corrections = None
+    spans_jsonl = None
+    if cleanup is not None:
+        cleaned, cstats = await _run_cleanup(cleanup, text, None)
+        text = cleaned
+        cleanup_method = cstats.method
+        cleanup_elapsed = round(cstats.elapsed_s, 3)
+        if cstats.audit is not None:
+            cstats.audit.log_summary("image")
+            corrections = {
+                "text_layer_backed": len(cstats.audit.text_layer_backed),
+                "ocr_vocab_backed": len(cstats.audit.ocr_vocab_backed),
+                "invented": len(cstats.audit.invented),
+                "formatting_only": cstats.audit.formatting_only,
+                "format_added_words": cstats.audit.format_added_words,
+                "format_removed_words": cstats.audit.format_removed_words,
+                "samples_invented": cstats.audit.invented[:8],
+                "samples_text_layer_backed": cstats.audit.text_layer_backed[:8],
+            }
+        spans_jsonl = cstats.spans_jsonl
+    else:
+        from .cleanup import strip_det_markers
+
+        text = strip_det_markers(text)
+    log.info(
+        "image done: ocr %.1fs (%d tok%s), cleanup %s %.1fs, %d chars",
+        elapsed,
+        getattr(stats, "tokens", 0) or 0,
+        ", early-stop" if getattr(stats, "early_stop", False) else "",
+        cleanup_method or "off",
+        cleanup_elapsed or 0.0,
+        len(text),
+    )
 
     return DocumentParseResponse(
         kind="image",
@@ -339,6 +419,10 @@ async def parse_image(
                 tps=round(getattr(stats, "tps", 0.0) or 0.0, 1) or None,
                 peak_memory_gb=round(getattr(stats, "peak_memory_gb", 0.0) or 0.0, 2) or None,
                 early_stop=bool(getattr(stats, "early_stop", False)),
+                cleanup_method=cleanup_method,
+                cleanup_elapsed_s=cleanup_elapsed,
+                corrections=corrections,
+                spans_jsonl=spans_jsonl,
             )
         ],
         total_elapsed_s=round(elapsed, 3),

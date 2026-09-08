@@ -21,7 +21,7 @@ from typing import Any
 
 from .engine import _dedupe_long_lines, _loop_period
 
-DEFAULT_CLEANUP_MODEL = "mlx-community/Qwen3.5-0.8B-MLX-4bit"
+DEFAULT_CLEANUP_MODEL = "mlx-community/Qwen3.5-0.8B-MLX-8bit"
 
 _DET_RE = re.compile(r"<\|det\|>[^<]*<\|/det\|>")
 _LEFTOVER_BRACKET_RE = re.compile(r"^\s*\[?\d+,\s*\d+(,\s*\d+)*\]?\s*$")

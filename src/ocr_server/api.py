@@ -58,11 +58,16 @@ def _get_cleanup_engine() -> CleanupEngine | None:
     return _cleanup_engine
 
 
+DEFAULT_MODEL_BF16 = "mlx-community/Unlimited-OCR-bf16"
+
+
 class EngineHolder:
     def __init__(self) -> None:
         self.engine: OcrEngine | FakeEngine | None = None
         self.is_fake = False
         self.model_ref: str | None = None
+        # Alternate OCR engine (lazy): e.g. bf16 for loop-free dense pages.
+        self.alt_engine: OcrEngine | None = None
 
     def load(self) -> None:
         # Read env here (not __init__) so tests/CLIs can set it after import.
@@ -80,6 +85,25 @@ class EngineHolder:
         self.engine = eng
         self.is_fake = False
         log.info("mlx-vlm model loaded: %s", model_ref)
+
+    def get_ocr_engine(self, ocr_model: str | None) -> OcrEngine | FakeEngine:
+        """Return the engine for the requested OCR model, loading on demand.
+
+        `ocr_model` may be an HF repo id/local path, or a shortcut:
+        "bf16" -> DEFAULT_MODEL_BF16. The default engine is preloaded at
+        startup; alternates load lazily and stay resident.
+        """
+        if self.is_fake or ocr_model in (None, "", "default"):
+            return self.engine
+        ref = DEFAULT_MODEL_BF16 if ocr_model == "bf16" else ocr_model
+        if ref == self.model_ref:
+            return self.engine
+        if self.alt_engine is None or self.alt_engine.model_ref != ref:
+            eng = OcrEngine(ref)
+            eng.load()
+            self.alt_engine = eng
+            log.info("alternate OCR model loaded: %s", ref)
+        return self.alt_engine
 
 
 holder = EngineHolder()
@@ -128,10 +152,8 @@ async def _save_upload(upload: UploadFile, suffix: str) -> Path:
     return path
 
 
-def _run_inference_sync(path: Path, params: InferenceParams):
+def _run_inference_sync(path: Path, params: InferenceParams, engine):
     """Blocking call into the engine (engine already loaded)."""
-    engine = holder.engine
-    assert engine is not None, "engine not loaded"
     t0 = time.perf_counter()
     text, stats = engine.infer_image_file(
         str(path),
@@ -146,10 +168,12 @@ def _run_inference_sync(path: Path, params: InferenceParams):
 
 
 async def _infer_image_path(
-    path: Path, params: InferenceParams
+    path: Path, params: InferenceParams, engine=None
 ) -> tuple[str, object, float]:
+    if engine is None:
+        engine = holder.engine
     async with infer_limiter:
-        return await anyio.to_thread.run_sync(_run_inference_sync, path, params)
+        return await anyio.to_thread.run_sync(_run_inference_sync, path, params, engine)
 
 
 def _run_cleanup_sync(cleanup: "CleanupEngine", ocr_text: str, text_layer: str | None):
@@ -188,6 +212,7 @@ async def _parse_pdf_path(
     pages: str,
     dpi: int,
     params: InferenceParams,
+    ocr_model: str | None = None,
 ) -> DocumentParseResponse:
     """Open, render, and OCR a PDF file. Caller owns cleanup of `path`."""
     import pymupdf
@@ -220,11 +245,12 @@ async def _parse_pdf_path(
         pass  # doc kept open: text layers are pulled per page during cleanup
 
     cleanup = _get_cleanup_engine()
+    engine = holder.get_ocr_engine(ocr_model)
     results: list[PageResult] = []
     total0 = time.perf_counter()
     try:
         for page_num, img_path in zip(page_nums, rendered):
-            text, stats, elapsed = await _infer_image_path(img_path, params)
+            text, stats, elapsed = await _infer_image_path(img_path, params, engine)
             page_res = PageResult(
                 page=page_num,
                 markdown=text,
@@ -280,13 +306,15 @@ async def parse_image(
     base_size: int = Form(1024),
     image_size: int = Form(640),
     cropping: bool = Form(True),
+    ocr_model: str = Form("default"),
 ) -> DocumentParseResponse:
     """Parse one image (JPEG/PNG/WebP) to markdown/text (gundam mode default)."""
     params = _params_from_form(prompt, max_tokens, temperature, base_size, image_size, cropping)
     suffix = Path(file.filename or "x.jpg").suffix.lower() or ".png"
     path = await _save_upload(file, suffix)
     try:
-        text, stats, elapsed = await _infer_image_path(path, params)
+        engine = holder.get_ocr_engine(ocr_model)
+        text, stats, elapsed = await _infer_image_path(path, params, engine)
         from .cleanup import strip_det_markers
         text = strip_det_markers(text)
     except HTTPException:
@@ -332,6 +360,7 @@ async def parse_pdf(
     base_size: int = Form(1024),
     image_size: int = Form(640),
     cropping: bool = Form(True),
+    ocr_model: str = Form("default"),
 ) -> DocumentParseResponse:
     """Parse a PDF to markdown. `pages` = "all" | "1-3,5". One OCR call per page.
 
@@ -341,7 +370,7 @@ async def parse_pdf(
     params = _params_from_form(prompt, max_tokens, temperature, base_size, image_size, cropping)
     path = await _save_upload(file, ".pdf")
     try:
-        return await _parse_pdf_path(path, pages=pages, dpi=dpi, params=params)
+        return await _parse_pdf_path(path, pages=pages, dpi=dpi, params=params, ocr_model=ocr_model)
     finally:
         path.unlink(missing_ok=True)
 
@@ -357,6 +386,7 @@ async def parse_pdf_async(
     base_size: int = Form(1024),
     image_size: int = Form(640),
     cropping: bool = Form(True),
+    ocr_model: str = Form("default"),
 ) -> JobStatus:
     """Submit a PDF parse as a background job (returns immediately with job_id)."""
     params = _params_from_form(prompt, max_tokens, temperature, base_size, image_size, cropping)
@@ -375,7 +405,7 @@ async def parse_pdf_async(
         job.started_at = time.time()
         job.status = "running"
         try:
-            resp = await _parse_pdf_path(path, pages=pages, dpi=dpi, params=params)
+            resp = await _parse_pdf_path(path, pages=pages, dpi=dpi, params=params, ocr_model=ocr_model)
             job.status = "done"
             job.result = resp
         except HTTPException as exc:

@@ -66,6 +66,35 @@ Findings:
    The cleanup stage lifts final fidelity ~10 points over raw OCR recall
    (0.79 → 0.89 on p1) by pulling wording from the text layer.
 
+## DPI × quantization interaction
+
+Same pages, swept at 72 / 150 / 200 / 300 dpi (harness supports `OCR_CMP_DPIS`).
+Recall on the **dense page** (p2):
+
+| dpi | mxfp8 | int8 | bf16 |
+|---|---|---|---|
+| 72 | .776 (loop, 46 s) | .840 (loop, 60 s) | .860 (9.5 s) |
+| 150 | .869 (loop, 7 s) | .867 (loop, 59 s) | .907 (10.4 s) |
+| 200 | .901 (loop, 24 s) | .856 (loop, 4 s) | .896 (10.6 s) |
+| 300 | .893 (clean, 8.8 s) | .884 (loop, 59 s) | .910 (10.4 s) |
+
+Sparse pages are flat within noise at every DPI — DPI only matters for dense
+content. Findings:
+
+1. Recall climbs from 72 → 150/200 and plateaus 150–300; 72 dpi is the failure
+   zone and also produces the longest repetition loops.
+2. **Higher DPI stabilizes mxfp8**: 300 dpi is its only loop-free point on the
+   dense page (cleaner input → less decoder drift), making mxfp8@300 the
+   fastest good-quality config (8.8 s vs bf16's 10.4 s).
+3. **bf16 is DPI-insensitive for stability** — loop-free at every DPI, flat
+   ~10 s wall-clock, top recall at 300.
+4. **int8 loops at every DPI** — disqualified for dense pages regardless of
+   render quality.
+5. Decoding is deterministic (greedy): re-runs reproduce token counts exactly.
+
+Server default is `dpi=300` for this reason; 200 is acceptable if you prefer
+smaller images with a loop-tolerant model (bf16) or accept the mxfp8 loop tax.
+
 ## Recommendations by memory budget
 
 Resident set = OCR engine + cleanup engine (+ alternate OCR if enabled).

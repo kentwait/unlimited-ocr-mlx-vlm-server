@@ -353,7 +353,7 @@ async def parse_image(
 async def parse_pdf(
     file: UploadFile = File(...),
     pages: str = Form("all"),
-    dpi: int = Form(150),
+    dpi: int = Form(300),
     prompt: str = Form("document parsing."),
     max_tokens: int = Form(8192),
     temperature: float = Form(0.0),
@@ -379,7 +379,7 @@ async def parse_pdf(
 async def parse_pdf_async(
     file: UploadFile = File(...),
     pages: str = Form("all"),
-    dpi: int = Form(150),
+    dpi: int = Form(300),
     prompt: str = Form("document parsing."),
     max_tokens: int = Form(8192),
     temperature: float = Form(0.0),

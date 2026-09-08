@@ -44,7 +44,8 @@ minutes. `GET /health` shows readiness.
 `POST /parse/pdf` — multipart:
 - `file`: PDF
 - `pages`: `"all"` | `"1-3,5"` (default all; max 50 pages/request)
-- `dpi`: render resolution, 72–300 (default 150)
+- `dpi`: render resolution, 72–300 (default 300; avoid 72 — it degrades
+  recall and triggers repetition loops on dense pages, see `MODEL_COMPARISON.md`)
 - optional OCR params as above (`cropping` defaults **true** — gundam mode;
   dense two-column publisher pages degenerate in base mode, which is only
   faster for sparse single-column pages), plus `ocr_model` — use `bf16` for

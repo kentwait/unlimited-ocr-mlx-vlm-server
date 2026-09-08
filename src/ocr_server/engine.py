@@ -51,6 +51,7 @@ class InferenceStats:
     tokens: int | None = None
     tps: float | None = None
     peak_memory_gb: float | None = None
+    early_stop: bool = False
 
 
 def decode_byte_level(tokenizer: Any, ids: list[int]) -> str:
@@ -83,6 +84,53 @@ def decode_byte_level(tokenizer: Any, ids: list[int]) -> str:
             else:
                 out.extend(ch.encode("utf-8"))
     return out.decode("utf-8", errors="replace")
+
+
+def _dedupe_long_lines(text: str, min_len: int = 40) -> str:
+    """Drop exact-duplicate long lines (loop remnants), keep first occurrence.
+
+    Repetition loops that escape the token-level break leave duplicated lines
+    in decoded text. Within a single page, identical long lines are
+    pathological; short lines (headers, numbers) are kept as-is.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for line in text.splitlines():
+        key = line.strip()
+        if len(key) >= min_len:
+            if key in seen:
+                continue
+            seen.add(key)
+        out.append(line)
+    return "\n".join(out)
+
+
+def _loop_period(
+    tokens: list[int],
+    *,
+    max_period: int = 32,
+    check_len: int = 96,
+    threshold: float = 0.95,
+) -> int | None:
+    """Return the period if the token tail is near-periodic, else None.
+
+    DeepSeek-OCR-style decoders degenerate into tight repetition loops on
+    dense/sparse-edge pages. Upstream's n-gram guard (n=35) only breaks
+    long-period repeats; short-period loops (repeated fragments, `89.89.89`,
+    `\\\\( \\\\alpha \\\\)` runs) never complete an exact 35-gram. Checking the
+    last `check_len` tokens for agreement with a p-shifted copy catches all
+    periods <= max_period cheaply on plain Python ints (no GPU sync).
+    """
+    n = len(tokens)
+    if n < check_len + max_period:
+        return None
+    recent = tokens[-check_len:]
+    for p in range(1, max_period + 1):
+        shifted = tokens[-check_len - p:-p]
+        agree = sum(1 for x, y in zip(recent, shifted) if x == y)
+        if agree >= threshold * check_len:
+            return p
+    return None
 
 
 class OcrEngine:
@@ -128,6 +176,7 @@ class OcrEngine:
         ids: list[int] = []
         tps = None
         peak_gb = None
+        loop_period: int | None = None
         t0 = _time.perf_counter()
         for resp in stream_generate(
             self.model,
@@ -144,13 +193,28 @@ class OcrEngine:
                 continue
             if resp.token is not None:
                 ids.append(int(resp.token))
+                # Cheap near-periodicity check every 16 tokens; break out of
+                # degenerate repetition loops instead of burning max_tokens.
+                if len(ids) % 16 == 0:
+                    p = _loop_period(ids)
+                    if p is not None:
+                        loop_period = p
+                        break
             tps = resp.generation_tps
             peak_gb = resp.peak_memory
         elapsed = _time.perf_counter() - t0
 
+        if loop_period is not None:
+            # Trim the loop tail: drop tokens past where the loop stabilized.
+            keep = len(ids) - 4 * (loop_period + 16)
+            ids = ids[: max(0, keep)]
         text = decode_byte_level(self.processor.tokenizer, ids).strip()
+        text = _dedupe_long_lines(text)
         if tps is None and elapsed > 0 and len(ids) > 0:
             tps = len(ids) / elapsed
         return text, InferenceStats(
-            tokens=len(ids), tps=tps, peak_memory_gb=peak_gb
+            tokens=len(ids),
+            tps=tps,
+            peak_memory_gb=peak_gb,
+            early_stop=loop_period is not None,
         )

@@ -205,6 +205,7 @@ async def _parse_pdf_path(
                     tokens=getattr(stats, "tokens", None),
                     tps=round(getattr(stats, "tps", 0.0) or 0.0, 1) or None,
                     peak_memory_gb=round(getattr(stats, "peak_memory_gb", 0.0) or 0.0, 2) or None,
+                    early_stop=bool(getattr(stats, "early_stop", False)),
                 )
             )
     finally:
@@ -238,7 +239,7 @@ async def health() -> HealthResponse:
 async def parse_image(
     file: UploadFile = File(...),
     prompt: str = Form("document parsing."),
-    max_tokens: int = Form(4096),
+    max_tokens: int = Form(8192),
     temperature: float = Form(0.0),
     base_size: int = Form(1024),
     image_size: int = Form(640),
@@ -271,6 +272,7 @@ async def parse_image(
                 tokens=getattr(stats, "tokens", None),
                 tps=round(getattr(stats, "tps", 0.0) or 0.0, 1) or None,
                 peak_memory_gb=round(getattr(stats, "peak_memory_gb", 0.0) or 0.0, 2) or None,
+                early_stop=bool(getattr(stats, "early_stop", False)),
             )
         ],
         total_elapsed_s=round(elapsed, 3),
@@ -287,11 +289,11 @@ async def parse_pdf(
     pages: str = Form("all"),
     dpi: int = Form(150),
     prompt: str = Form("document parsing."),
-    max_tokens: int = Form(4096),
+    max_tokens: int = Form(8192),
     temperature: float = Form(0.0),
     base_size: int = Form(1024),
     image_size: int = Form(640),
-    cropping: bool = Form(False),
+    cropping: bool = Form(True),
 ) -> DocumentParseResponse:
     """Parse a PDF to markdown. `pages` = "all" | "1-3,5". One OCR call per page.
 
@@ -312,11 +314,11 @@ async def parse_pdf_async(
     pages: str = Form("all"),
     dpi: int = Form(150),
     prompt: str = Form("document parsing."),
-    max_tokens: int = Form(4096),
+    max_tokens: int = Form(8192),
     temperature: float = Form(0.0),
     base_size: int = Form(1024),
     image_size: int = Form(640),
-    cropping: bool = Form(False),
+    cropping: bool = Form(True),
 ) -> JobStatus:
     """Submit a PDF parse as a background job (returns immediately with job_id)."""
     params = _params_from_form(prompt, max_tokens, temperature, base_size, image_size, cropping)

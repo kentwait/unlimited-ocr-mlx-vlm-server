@@ -43,6 +43,7 @@ class PageResult(BaseModel):
     tokens: int | None = None
     tps: float | None = None
     peak_memory_gb: float | None = None
+    early_stop: bool = False  # generation loop detected and truncated
 
 
 class DocumentParseResponse(BaseModel):

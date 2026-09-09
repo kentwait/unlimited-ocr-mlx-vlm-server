@@ -1,19 +1,13 @@
-"""Furniture removal pass: journal headers/footers/side stamps.
+"""Furniture removal pass: repeated headers/footers/page stamps.
 
 Runs on the span intermediate BEFORE markdown rendering and the checker LLM —
 this is a layout-transformation pass, separate from content correction.
 
-Two layers:
-
-1. **Journal templates** (nature / science / pmc): position-band + regex rules
-   encoding each publisher's furniture placement. Auto-detected per document
-   by scoring rule hits across pages; can be forced via the `furniture` form
-   field ("none" disables everything).
-
-2. **Generic repetition fingerprinting** (always on for multi-page docs): any
-   span in the top 6% / bottom 5% of the page whose digit-normalized text
-   repeats on >= max(2, 50%) of pages is furniture — catches unknown journals
-   without a template.
+Generic repetition fingerprinting only (deliberately journal-agnostic): any
+span in the top 6% / bottom 5% of the page whose digit-normalized text
+repeats on >= max(2, 50%) of pages is furniture. Journal-specific templates
+used to live here; they moved to Paperhub's client-side reflow layer, which
+owns all academic-paper rules on top of the `spans_jsonl` contract.
 
 Furniture spans are RELABELED `furniture` and kept in `spans_jsonl`
 (lossless — consumers can recover them); they are excluded from the markdown
@@ -39,7 +33,8 @@ BOTTOM_BAND = 950  # span bottom edge below this -> bottom band
 # abstracts) near the top are content even when they repeat (e.g. continued
 # abstract pages).
 MAX_GENERIC_CHARS = 120
-# PMC stamps sit slightly higher; the pmc template overrides its bottom band.
+# PMC stamps sit slightly higher; the generic bottom band still catches them
+# through repetition (they repeat on every page by definition).
 
 # Digit-normalized text -> fingerprint (page numbers, dates, volumes collapse).
 _DIGITS_RE = re.compile(r"\d+")
@@ -59,103 +54,6 @@ def _band(span: "Span") -> str | None:
     if y2 > BOTTOM_BAND:
         return "bottom"
     return None
-
-
-# ---------------------------------------------------------------------------
-# Journal templates: (band, regex) rules. Case-insensitive substring match.
-# ---------------------------------------------------------------------------
-
-TEMPLATES: dict[str, dict] = {
-    "nature": {
-        "top_band": (0, 45),
-        "top_rules": [r"^article$"],
-        "bottom_band": (935, 1000),
-        "bottom_rules": [r"nature", r"www\.nature\.com"],
-        "anywhere_rules": [],
-    },
-    "science": {
-        "top_band": (0, 60),
-        "top_rules": [r"^research\b", r"completing the human genome"],
-        "bottom_band": (945, 1000),
-        "bottom_rules": [r"science\s+\d+", r"\bof \d+\b"],
-        "anywhere_rules": [],
-    },
-    "pmc": {
-        "top_band": (0, 80),
-        "top_rules": [r"^page \d+"],
-        "bottom_band": (870, 1000),
-        "bottom_rules": [r"author manuscript", r"available in pmc", r"^graphical abstract$"],
-        "anywhere_rules": [r"^author manuscript$"],
-    },
-}
-
-_NORM_STRIP_RE = re.compile(r"[^a-z0-9 ]")
-
-
-def _matches(span_text: str, rules: list[str]) -> bool:
-    t = _NORM_STRIP_RE.sub(" ", span_text.lower())
-    t = _WS_RE.sub(" ", t).strip()
-    return any(re.search(rx, t) for rx in rules)
-
-
-def _in_band(span: "Span", band: tuple[int, int]) -> bool:
-    """True when the span STARTS inside the band (top edge in [lo, hi])."""
-    if span.box is None:
-        return False
-    y1 = span.box[1]
-    return band[0] <= y1 <= band[1]
-
-
-def _rule_hits(pages_spans: list[list["Span"]], tpl: dict) -> int:
-    """Pages on which at least one template rule fires."""
-    hits = 0
-    for spans in pages_spans:
-        fired = False
-        for s in spans:
-            if not s.text:
-                continue
-            if (
-                _in_band(s, tpl["top_band"])
-                and _matches(s.text, tpl["top_rules"])
-            ) or (
-                _in_band(s, tpl["bottom_band"])
-                and _matches(s.text, tpl["bottom_rules"])
-            ) or (
-                tpl["anywhere_rules"] and _matches(s.text, tpl["anywhere_rules"])
-            ):
-                fired = True
-                break
-        if fired:
-            hits += 1
-    return hits
-
-
-def detect_template(pages_spans: list[list["Span"]]) -> str | None:
-    """Pick the template whose rules fire on enough pages; None if none does."""
-    n = len(pages_spans)
-    need = max(1, int(0.4 * n + 0.999))  # >=40% of pages, at least 1
-    best, best_hits = None, 0
-    for name, tpl in TEMPLATES.items():
-        hits = _rule_hits(pages_spans, tpl)
-        if hits >= need and hits > best_hits:
-            best, best_hits = name, hits
-    return best
-
-
-def _apply_template(pages_spans, tpl: dict) -> int:
-    removed = 0
-    for spans in pages_spans:
-        for s in spans:
-            if s.label == "furniture" or not s.text:
-                continue
-            if (
-                (_in_band(s, tpl["top_band"]) and _matches(s.text, tpl["top_rules"]))
-                or (_in_band(s, tpl["bottom_band"]) and _matches(s.text, tpl["bottom_rules"]))
-                or (tpl["anywhere_rules"] and _matches(s.text, tpl["anywhere_rules"]))
-            ):
-                s.label = "furniture"
-                removed += 1
-    return removed
 
 
 def _apply_generic(pages_spans) -> int:
@@ -199,20 +97,19 @@ def apply_furniture(
 ) -> dict:
     """Relabel furniture spans in place. Returns an info dict for logging.
 
-    template: "auto" | "none" | a TEMPLATES key.
+    template: "auto" (generic fingerprinting) | "none" (disabled).
+    Anything else raises ValueError — journal templates live in Paperhub now.
+    The info dict keeps its shape ({template, removed_total, removed_by_page,
+    samples}) with template always None: generic detection has no name.
     """
+    if template not in ("auto", "none"):
+        raise ValueError(
+            f"unknown furniture mode {template!r}: expected 'auto' or 'none' "
+            "(journal templates moved to Paperhub's reflow layer)"
+        )
     n_pages = len(pages_spans)
-    tpl_name = None
-    if template != "none":
-        if template in TEMPLATES:
-            tpl_name = template
-        else:  # auto
-            tpl_name = detect_template(pages_spans)
 
-    tpl_removed = 0
-    if tpl_name is not None:
-        tpl_removed = _apply_template(pages_spans, TEMPLATES[tpl_name])
-    generic_removed = _apply_generic(pages_spans) if tpl_name is not None or template == "auto" else 0
+    generic_removed = _apply_generic(pages_spans) if template == "auto" else 0
 
     per_page_counts = [sum(1 for s in spans if s.label == "furniture") for spans in pages_spans]
     samples = [
@@ -221,18 +118,16 @@ def apply_furniture(
         if any(s.label == "furniture" for s in spans)
     ][:3]
     log.info(
-        "furniture pass: template=%s removed=%d (template %d, generic %d) "
+        "furniture pass: removed=%d (generic %d) "
         "across %d pages | per-page: %s | samples: %s",
-        tpl_name or "none",
         sum(per_page_counts),
-        tpl_removed,
         generic_removed,
         n_pages,
         per_page_counts,
         samples or "none",
     )
     return {
-        "template": tpl_name,
+        "template": None,
         "removed_total": sum(per_page_counts),
         "removed_by_page": per_page_counts,
         "samples": samples,

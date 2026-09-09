@@ -151,7 +151,7 @@ _CORS_DEFAULT = [
     "tauri://localhost",  # Tauri v2 production (macOS/Linux)
     "http://tauri.localhost",  # Tauri v2 production (Windows)
     "http://localhost:1420",  # Tauri dev server default (other apps)
-    "http://localhost:1421",  # this app's Tauri dev server (see ui/package.json)
+    "http://localhost:1431",  # Paperhub's Tauri dev server (vite default port)
     "http://localhost:5173",  # vite dev
 ]
 _CORS_ORIGINS = _CORS_DEFAULT + [
@@ -162,9 +162,10 @@ _CORS_ORIGINS = _CORS_DEFAULT + [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_CORS_ORIGINS,
-    # Dev ports are assigned dynamically (each Tauri app probes from 1420
-    # up — see ui/scripts/tauri-dev.ts), so match the whole loopback range
-    # instead of enumerating ports. Production Tauri origins are exact above.
+    # Dev ports are assigned dynamically (each Tauri app probes a port block
+    # upward from its base — Paperhub from 1430, see scripts/tauri-dev.ts in
+    # the Paperhub repo), so match the whole loopback range instead of
+    # enumerating ports. Production Tauri origins are exact above.
     allow_origin_regex=r"http://(localhost|127\.0\.0\.1):14\d\d",
     allow_methods=["*"],
     allow_headers=["*"],
@@ -255,6 +256,18 @@ def _params_from_form(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
 
 
+def _furniture_from_form(furniture: str) -> str:
+    """Eager `furniture` field validation: fail fast with 400, including
+    before a background job is created (job errors are poll-only)."""
+    if furniture not in ("auto", "none"):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"unknown furniture mode {furniture!r}: expected 'auto' or 'none' "
+            "(journal templates moved to Paperhub's reflow layer)",
+        )
+    return furniture
+
+
 async def _parse_pdf_path(
     path: Path,
     *,
@@ -305,8 +318,7 @@ async def _parse_pdf_path(
     engine = holder.get_ocr_engine(ocr_model)
 
     # Furniture pass needs the whole document's OCR first (cross-page
-    # fingerprints + template detection), so run OCR for all pages, then
-    # process.
+    # fingerprints), so run OCR for all pages, then process.
     page_ocr: list[tuple[int, Path, str, object, float]] = []
     total0 = time.perf_counter()
     try:
@@ -317,10 +329,14 @@ async def _parse_pdf_path(
                 job.phase = "ocr"
                 job.pages_done = len(page_ocr)
 
-        # Furniture removal on the span intermediate (template auto-detect or
-        # forced via the `furniture` field; "none" disables).
+        # Furniture removal on the span intermediate (generic repetition
+        # fingerprinting; "none" disables). Journal-specific templates live
+        # in Paperhub's reflow layer — this server stays journal-agnostic.
         all_spans = [parse_spans(t, page=n) for n, _, t, _, _ in page_ocr]
-        finfo = apply_furniture(all_spans, template=furniture)
+        try:
+            finfo = apply_furniture(all_spans, template=furniture)
+        except ValueError as exc:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
         doc_furniture = {
             "template": finfo["template"],
             "removed_total": finfo["removed_total"],
@@ -403,13 +419,12 @@ async def _parse_pdf_path(
     tot_inv = sum((r.corrections or {}).get("invented", 0) for r in results)
     log.info(
         "request summary: %d pages in %.1fs (%.1f s/page avg) | checker edits: %d "
-        "total, %d invented | furniture: template=%s removed=%d | ocr_model=%s dpi=%d",
+        "total, %d invented | furniture removed=%d | ocr_model=%s dpi=%d",
         len(results),
         total_elapsed,
         total_elapsed / max(1, len(results)),
         tot_edits,
         tot_inv,
-        doc_furniture["template"],
         doc_furniture["removed_total"],
         ocr_model or "default",
         dpi,
@@ -543,6 +558,7 @@ async def parse_pdf(
     multi-page workflows; pass cropping=true for dense single pages.
     """
     params = _params_from_form(prompt, max_tokens, temperature, base_size, image_size, cropping)
+    furniture = _furniture_from_form(furniture)
     path = await _save_upload(file, ".pdf")
     try:
         return await _parse_pdf_path(
@@ -568,6 +584,7 @@ async def parse_pdf_async(
 ) -> JobStatus:
     """Submit a PDF parse as a background job (returns immediately with job_id)."""
     params = _params_from_form(prompt, max_tokens, temperature, base_size, image_size, cropping)
+    furniture = _furniture_from_form(furniture)
     path = await _save_upload(file, ".pdf")
     job_id = uuid.uuid4().hex[:12]
     job = JobStatus(

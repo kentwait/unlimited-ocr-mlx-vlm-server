@@ -12,3 +12,15 @@ models/
 output/
 *.log
 .DS_Store
+
+# Web/desktop build outputs (the Tauri app lives in Paperhub now; nothing
+# under ui/ is tracked anymore, but keep these guards so a stray
+# `git add -A` can never sweep regenerable artifacts into history again)
+node_modules/
+dist/
+target/
+.tanstack/
+coverage/
+*.tsbuildinfo
+playwright-report/
+test-results/

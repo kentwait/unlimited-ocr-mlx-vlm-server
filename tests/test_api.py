@@ -187,3 +187,53 @@ def test_job_flow(client):
 def test_job_unknown_id(client):
     r = client.get("/parse/jobs/deadbeef")
     assert r.status_code == 404
+
+
+# ---------- furniture (generic-only; journal templates live in Paperhub) ----------
+
+
+def test_parse_pdf_furniture_none_ok(client):
+    r = client.post(
+        "/parse/pdf",
+        files={"file": ("t.pdf", _pdf_bytes(2), "application/pdf")},
+        data={"pages": "all", "furniture": "none"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["furniture"]["removed_total"] == 0
+
+
+def test_parse_pdf_furniture_rejects_journal_template(client):
+    r = client.post(
+        "/parse/pdf",
+        files={"file": ("t.pdf", _pdf_bytes(1), "application/pdf")},
+        data={"pages": "all", "furniture": "nature"},
+    )
+    assert r.status_code == 400
+    assert "auto" in r.json()["detail"]
+
+
+def test_parse_jobs_furniture_rejects_before_creating_job(client):
+    r = client.post(
+        "/parse/jobs",
+        files={"file": ("t.pdf", _pdf_bytes(1), "application/pdf")},
+        data={"pages": "all", "furniture": "pmc"},
+    )
+    assert r.status_code == 400
+
+
+def test_apply_furniture_rejects_unknown_mode():
+    from ocr_server.furniture import apply_furniture
+
+    with pytest.raises(ValueError, match="unknown furniture mode"):
+        apply_furniture([[]], template="science")
+
+
+def test_apply_furniture_none_is_noop():
+    from ocr_server.furniture import apply_furniture
+    from ocr_server.spans import Span
+
+    spans = [[Span(page=1, label="text", box=[0, 0, 100, 10], text="Nature")]]
+    info = apply_furniture(spans, template="none")
+    assert info["template"] is None
+    assert info["removed_total"] == 0
+    assert spans[0][0].label == "text"

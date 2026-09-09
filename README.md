@@ -1,5 +1,14 @@
 # unlimited-ocr-server
 
+> **Desktop app moved out.** The Tauri companion app (formerly `ui/` in this
+> repo) now lives in the Paperhub repo (history preserved via renames), which
+> consumes this server as a pinned git submodule over the `spans_jsonl` +
+> sidecar contract. This repo stays server-only: generic PDF → markdown
+> (OCR + checker LLM + generic repetition-based furniture removal).
+> Journal-specific templates moved to Paperhub's reflow layer, so the
+> `furniture` form field now accepts only `auto` (generic fingerprinting)
+> or `none` (disabled); anything else is a 400.
+
 LAN-accessible FastAPI server wrapping **baidu/Unlimited-OCR** (DeepSeek-OCR
 lineage) as quantized by [sahilchachra/unlimited-ocr-mxfp8-mlx](https://huggingface.co/sahilchachra/unlimited-ocr-mxfp8-mlx)
 (block-float MXFP8, ~3.7 GB on disk, ~5 GB peak memory). Serves

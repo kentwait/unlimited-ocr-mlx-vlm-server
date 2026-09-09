@@ -128,16 +128,13 @@ export function LibraryPage(): React.JSX.Element {
   }, [])
 
   /** Markdown scroll position: PDF anchors to the span's page. */
-  const handleMdVisible = useCallback(
-    (_page: number, span: Span | null) => {
-      const page = span?.page ?? _page
-      if (pageMirror.current !== page) {
-        setCurrentPage(page)
-        setPdfToken((t) => t + 1)
-      }
-    },
-    [],
-  )
+  const handleMdVisible = useCallback((_page: number, span: Span | null) => {
+    const page = span?.page ?? _page
+    if (pageMirror.current !== page) {
+      setCurrentPage(page)
+      setPdfToken((t) => t + 1)
+    }
+  }, [])
 
   const loadTree = useCallback(async (rootPath: string) => {
     setTreeError(null)

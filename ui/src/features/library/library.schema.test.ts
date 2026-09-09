@@ -6,6 +6,7 @@ import { TreeNodeSchema, SpanSchema } from './library.schema'
 import {
   markdownPathFor,
   parseSpansJsonl,
+  pickReadingPage,
   spansPathFor,
 } from './library.functions'
 
@@ -86,5 +87,25 @@ describe('sidecar paths', () => {
   it('derives sibling md and spans paths from a pdf path', () => {
     expect(markdownPathFor('/a/b/paper.PDF')).toBe('/a/b/paper.md')
     expect(spansPathFor('/a/b/paper.pdf')).toBe('/a/b/paper.spans.jsonl')
+  })
+})
+
+describe('pickReadingPage', () => {
+  const entries = [
+    { page: 1, top: -800 },
+    { page: 2, top: -100 },
+    { page: 3, top: 500 },
+  ]
+  it('anchors to the last entry above the line', () => {
+    expect(pickReadingPage(entries, 200)).toBe(2)
+  })
+  it('sticks to the first page above the top', () => {
+    expect(pickReadingPage(entries, -900)).toBe(null)
+  })
+  it('advances when the next page crosses the line', () => {
+    expect(pickReadingPage(entries, 500)).toBe(3)
+  })
+  it('returns null for no entries', () => {
+    expect(pickReadingPage([], 200)).toBe(null)
   })
 })

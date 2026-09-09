@@ -78,6 +78,23 @@ export function spansPathFor(pdfPath: string): string {
 }
 
 /**
+ * Picks the reading position from page/chunk tops relative to the scroll
+ * container: the last entry whose top sits above the anchor line (25% down
+ * the viewport). Entries must arrive in page-ascending order. Anchors sync
+ * to a discrete page instead of chasing smooth-scroll positions.
+ */
+export function pickReadingPage(
+  entries: { page: number; top: number }[],
+  line: number,
+): number | null {
+  let best: number | null = null
+  for (const entry of entries) {
+    if (entry.top <= line) best = entry.page
+  }
+  return best
+}
+
+/**
  * Reads a PDF's bytes for preview/upload. Inside Tauri this goes through the
  * fs plugin (same root scope as the asset protocol, but a transport that
  * actually delivers bytes to fetch-hostile WebKit paths); outside Tauri it

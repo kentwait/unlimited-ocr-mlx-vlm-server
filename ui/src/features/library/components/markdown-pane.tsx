@@ -5,7 +5,8 @@ import { Code2, Eye } from 'lucide-react'
 
 import { cn } from '#/lib/cn'
 
-import type { FocusSpan, MarkdownChunk } from '../library.schema'
+import { pickReadingPage } from '../library.functions'
+import type { FocusSpan, MarkdownChunk, Span } from '../library.schema'
 
 const PAGE_ANCHOR_RE = /<!--\s*ocr:page:(\d+)\s*-->/
 
@@ -118,10 +119,16 @@ type MarkdownPaneProps = {
   scrollToken: number
   /** Section-level focus from overlay clicks (span text snippet). */
   focusSpan?: FocusSpan | null
-  /** Markdown -> PDF: the most-visible chunk's page while scrolling. */
-  onVisiblePage?: (page: number) => void
+  /**
+   * Markdown -> PDF: the anchored reading position while scrolling —
+   * page anchor from chunks, span anchor from the topmost visible block
+   * matched back to its OCR span. Null span = page-level fallback.
+   */
+  onVisiblePage?: (page: number, span: Span | null) => void
   /** Page selector in this pane's header (mirrors the PDF pager). */
   onJumpPage?: (page: number) => void
+  /** OCR spans for matching visible blocks back to their span anchor. */
+  spansByPage?: Map<number, Span[]> | null
   emptyHint: string
 }
 
@@ -135,6 +142,7 @@ export function MarkdownPane({
   focusSpan,
   onVisiblePage,
   onJumpPage,
+  spansByPage,
   emptyHint,
 }: MarkdownPaneProps): React.JSX.Element {
   const [mode, setMode] = useState<'rendered' | 'source'>('rendered')
@@ -147,6 +155,16 @@ export function MarkdownPane({
   pageForScroll.current = currentPage
   const visibleRef = useRef(onVisiblePage)
   visibleRef.current = onVisiblePage
+  // Suppression window: while a programmatic follow-scroll is in flight,
+  // scroll tracking stays quiet so panes can't chase each other.
+  const followGuard = useRef(false)
+  const guardTimer = useRef<number | null>(null)
+  useEffect(() => {
+    const timer = guardTimer.current
+    return () => {
+      if (timer !== null) window.clearTimeout(timer)
+    }
+  }, [])
 
   const chunks = useMemo(
     () => (markdown === null ? null : splitByAnchors(markdown)),
@@ -154,49 +172,77 @@ export function MarkdownPane({
   )
   const hasAnchors = chunks !== null
 
-  // PDF -> markdown: scroll the active page's chunk into view. Runs only on
+  function suppressFollow(ms: number): void {
+    followGuard.current = true
+    if (guardTimer.current !== null) window.clearTimeout(guardTimer.current)
+    guardTimer.current = window.setTimeout(() => {
+      followGuard.current = false
+    }, ms)
+  }
+
+  // PDF -> markdown: anchor the active page's chunk into view. Runs only on
   // scrollToken (PDF-originated) changes, plus sync/markdown toggles.
+  // Discrete jump (no smooth chase) + suppression window: no feedback loop.
   useEffect(() => {
     if (!syncEnabled || !hasAnchors) return
     const page = pageForScroll.current
     if (page <= 0) return
     const el = chunkRefs.current.get(page)
     if (el === undefined) return
-    el.scrollIntoView({ block: 'start', behavior: 'smooth' })
+    suppressFollow(450)
+    el.scrollIntoView({ block: 'start', behavior: 'auto' })
     setActivePage(page)
   }, [scrollToken, syncEnabled, hasAnchors, markdown])
 
-  // Markdown -> PDF: report the most-visible chunk while scrolling.
-  useEffect(() => {
+  // Markdown -> PDF: report the anchored reading position while scrolling.
+  // Page anchor from chunks, span anchor from the topmost visible block
+  // matched back to its OCR span. rAF-throttled; quiet during follow-scrolls.
+  const trackVisible = useCallback(() => {
     const root = scrollRef.current
-    if (
-      !syncEnabled ||
-      root === null ||
-      chunks === null ||
-      typeof IntersectionObserver === 'undefined'
-    ) {
-      return
+    if (!syncEnabled || root === null || followGuard.current) return
+    const rootTop = root.getBoundingClientRect().top
+    const line = root.clientHeight * 0.25
+    const entries: { page: number; top: number }[] = []
+    for (const [page, el] of chunkRefs.current) {
+      entries.push({
+        page,
+        top: el.getBoundingClientRect().top - rootTop,
+      })
     }
-    const observer = new IntersectionObserver(
-      (entries) => {
-        let best: { page: number; ratio: number } | null = null
-        for (const entry of entries) {
-          const page = Number(entry.target.getAttribute('data-page'))
-          if (
-            entry.isIntersecting &&
-            Number.isFinite(page) &&
-            (best === null || entry.intersectionRatio > best.ratio)
-          ) {
-            best = { page, ratio: entry.intersectionRatio }
-          }
+    const page = pickReadingPage(entries, line)
+    if (page === null) return
+    // Span anchor: topmost visible block within the anchored chunk.
+    let span: Span | null = null
+    const chunkEl = chunkRefs.current.get(page)
+    const pageSpans = spansByPage?.get(page)
+    if (chunkEl !== undefined && pageSpans !== undefined) {
+      const blocks = [
+        ...chunkEl.querySelectorAll(
+          'p, li, h1, h2, h3, h4, blockquote, td, pre',
+        ),
+      ]
+      let blockText: string | null = null
+      for (const block of blocks) {
+        if (block.getBoundingClientRect().top - rootTop <= line) {
+          blockText = normalizeSnippetText(block.textContent)
         }
-        if (best !== null) visibleRef.current?.(best.page)
-      },
-      { root, threshold: [0.25, 0.5, 0.75] },
-    )
-    for (const el of chunkRefs.current.values()) observer.observe(el)
-    return () => observer.disconnect()
-  }, [chunks, syncEnabled])
+      }
+      if (blockText !== null && blockText.length > 0) {
+        const idx = findSnippetBlock(
+          pageSpans.map((s) => s.text),
+          blockText,
+        )
+        if (idx !== -1) span = pageSpans[idx] ?? null
+      }
+    }
+    visibleRef.current?.(page, span)
+  }, [syncEnabled, spansByPage])
+
+  const rafRef = useRef(0)
+  useEffect(() => {
+    const id = rafRef.current
+    return () => cancelAnimationFrame(id)
+  }, [])
 
   // Overlay -> markdown: scroll to the block matching the span snippet,
   // flash it, fall back to the chunk top when nothing matches.
@@ -213,7 +259,8 @@ export function MarkdownPane({
     )
     const found = idx !== -1 ? blocks[idx] : undefined
     const target: HTMLElement = found instanceof HTMLElement ? found : chunkEl
-    target.scrollIntoView({ block: 'center', behavior: 'smooth' })
+    suppressFollow(450)
+    target.scrollIntoView({ block: 'center', behavior: 'auto' })
     setActivePage(focusSpan.page)
     if (typeof target.animate === 'function') {
       target.animate(
@@ -302,7 +349,14 @@ export function MarkdownPane({
           </span>
         )}
       </div>
-      <div ref={scrollRef} className="flex-1 overflow-auto px-5 py-4">
+      <div
+        ref={scrollRef}
+        onScroll={() => {
+          cancelAnimationFrame(rafRef.current)
+          rafRef.current = requestAnimationFrame(() => trackVisible())
+        }}
+        className="flex-1 overflow-auto px-5 py-4"
+      >
         {hasAnchors ? (
           chunks.map((chunk) => (
             <div

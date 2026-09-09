@@ -114,8 +114,9 @@ export function LibraryPage(): React.JSX.Element {
     setFocusSpan({ page: span.page, snippet: span.text, nonce: Date.now() })
   }, [])
 
-  /** Markdown-originated page change: moves preview only (no scroll yank). */
-  const handleVisiblePage = useCallback((page: number) => {
+  /** Markdown-originated position: moves state only (never scrolls PDF). */
+  const handleVisiblePage = useCallback((_page: number, span: Span | null) => {
+    const page = span?.page ?? _page
     if (pageMirror.current !== page) setCurrentPage(page)
   }, [])
 
@@ -487,7 +488,8 @@ export function LibraryPage(): React.JSX.Element {
             <PdfPane
               pdfNode={selected}
               currentPage={currentPage}
-              onPageChange={goPdfPage}
+              onTrackPage={(page) => handleVisiblePage(page, null)}
+              onJumpPage={goPdfPage}
               scrollToken={scrollToken}
               spansByPage={spans}
               syncEnabled={syncEnabled}
@@ -522,6 +524,7 @@ export function LibraryPage(): React.JSX.Element {
             focusSpan={focusSpan}
             onVisiblePage={handleVisiblePage}
             onJumpPage={goPdfPage}
+            spansByPage={spans}
             emptyHint={
               selected === null
                 ? 'Select a PDF to see its markdown.'

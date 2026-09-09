@@ -4,7 +4,7 @@ import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 import { AlertTriangle, ChevronLeft, ChevronRight, Loader2 } from 'lucide-react'
 
 import { Button } from '#/shared/components/ui/button'
-import { debugFs, readPdfBytes } from '../library.functions'
+import { debugFs, pickReadingPage, readPdfBytes } from '../library.functions'
 import type { Span, TreeNode } from '../library.schema'
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl
@@ -20,7 +20,10 @@ type OverlayRect = {
 type PdfPaneProps = {
   pdfNode: TreeNode
   currentPage: number
-  onPageChange: (page: number) => void
+  /** Scroll tracking reports (page anchor): moves state only, never scrolls. */
+  onTrackPage: (page: number) => void
+  /** Pager/keyboard jumps: parent bumps scrollToken so the list scrolls. */
+  onJumpPage: (page: number) => void
   /** Bumped only by externally-originated jumps (pager, chunk clicks). */
   scrollToken: number
   spansByPage: Map<number, Span[]> | null
@@ -178,7 +181,8 @@ function PageCanvas({
 export function PdfPane({
   pdfNode,
   currentPage,
-  onPageChange,
+  onTrackPage,
+  onJumpPage,
   scrollToken,
   spansByPage,
   syncEnabled,
@@ -193,8 +197,28 @@ export function PdfPane({
   const [wrapWidth, setWrapWidth] = useState(720)
   const pageForScroll = useRef(currentPage)
   pageForScroll.current = currentPage
-  const changeRef = useRef(onPageChange)
-  changeRef.current = onPageChange
+  const trackRef = useRef(onTrackPage)
+  trackRef.current = onTrackPage
+  const jumpRef = useRef(onJumpPage)
+  jumpRef.current = onJumpPage
+  // Suppression window: while a jump scroll is in flight, scroll tracking
+  // stays quiet so the list can't chase its own programmatic scroll.
+  const followGuard = useRef(false)
+  const guardTimer = useRef<number | null>(null)
+  useEffect(() => {
+    const timer = guardTimer.current
+    return () => {
+      if (timer !== null) window.clearTimeout(timer)
+    }
+  }, [])
+
+  function suppressFollow(ms: number): void {
+    followGuard.current = true
+    if (guardTimer.current !== null) window.clearTimeout(guardTimer.current)
+    guardTimer.current = window.setTimeout(() => {
+      followGuard.current = false
+    }, ms)
+  }
 
   // Load the document once per file. Bytes come through the fs plugin
   // (scope granted in the Rust set_root command), bypassing the asset
@@ -281,50 +305,44 @@ export function PdfPane({
     setRenderError((prev) => prev ?? message)
   }, [])
 
-  // Scroll-driven page tracking: the most-visible page becomes current.
-  useEffect(() => {
+  // Scroll-driven page tracking (page anchor): the page whose top last
+  // crossed the anchor line becomes current. State only — never scrolls.
+  // rAF-throttled; quiet during jump scrolls.
+  const trackVisible = useCallback(() => {
     const root = wrapRef.current
-    if (
-      doc === null ||
-      numPages === 0 ||
-      root === null ||
-      typeof IntersectionObserver === 'undefined'
-    ) {
-      return
+    if (doc === null || root === null || followGuard.current) return
+    const rootTop = root.getBoundingClientRect().top
+    const entries: { page: number; top: number }[] = []
+    for (const [page, el] of pageEls.current) {
+      entries.push({
+        page,
+        top: el.getBoundingClientRect().top - rootTop,
+      })
     }
-    const observer = new IntersectionObserver(
-      (entries) => {
-        let best: { page: number; ratio: number } | null = null
-        for (const entry of entries) {
-          const page = Number(entry.target.getAttribute('data-page'))
-          if (
-            entry.isIntersecting &&
-            Number.isFinite(page) &&
-            (best === null || entry.intersectionRatio > best.ratio)
-          ) {
-            best = { page, ratio: entry.intersectionRatio }
-          }
-        }
-        if (best !== null) changeRef.current(best.page)
-      },
-      { root, threshold: [0.25, 0.5, 0.75] },
-    )
-    for (const el of pageEls.current.values()) observer.observe(el)
-    return () => observer.disconnect()
-  }, [doc, numPages, syncEnabled])
+    const best = pickReadingPage(entries, root.clientHeight * 0.25)
+    if (best !== null) trackRef.current(best)
+  }, [doc])
 
-  // Externally-originated jumps (pager, chunk clicks) scroll the page list.
+  const scrollRaf = useRef(0)
+  useEffect(() => {
+    const id = scrollRaf.current
+    return () => cancelAnimationFrame(id)
+  }, [])
+
+  // Externally-originated jumps (pager, chunk clicks, markdown scroll)
+  // anchor the page list. Discrete jump + suppression: no feedback loop.
   useEffect(() => {
     if (scrollToken === 0) return
-    pageEls.current
-      .get(pageForScroll.current)
-      ?.scrollIntoView({ block: 'start', behavior: 'smooth' })
+    const el = pageEls.current.get(pageForScroll.current)
+    if (el === undefined) return
+    suppressFollow(450)
+    el.scrollIntoView({ block: 'start', behavior: 'auto' })
   }, [scrollToken])
 
   const goPage = useCallback(
     (delta: number) => {
       const next = pageForScroll.current + delta
-      if (next >= 1 && next <= numPages) changeRef.current(next)
+      if (next >= 1 && next <= numPages) jumpRef.current(next)
     },
     [numPages],
   )
@@ -375,6 +393,10 @@ export function PdfPane({
         ref={wrapRef}
         tabIndex={0}
         onKeyDown={onKeyDown}
+        onScroll={() => {
+          cancelAnimationFrame(scrollRaf.current)
+          scrollRaf.current = requestAnimationFrame(() => trackVisible())
+        }}
         className="relative flex-1 overflow-auto bg-muted/40 outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
       >
         {loadError !== null ? (

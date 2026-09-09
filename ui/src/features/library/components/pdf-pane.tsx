@@ -5,6 +5,7 @@ import { AlertTriangle, ChevronLeft, ChevronRight, Loader2 } from 'lucide-react'
 
 import { Button } from '#/shared/components/ui/button'
 import { debugFs, pickReadingPage, readPdfBytes } from '../library.functions'
+import { scrollChildIntoView } from '../scroll'
 import type { Span, TreeNode } from '../library.schema'
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl
@@ -334,9 +335,10 @@ export function PdfPane({
   useEffect(() => {
     if (scrollToken === 0) return
     const el = pageEls.current.get(pageForScroll.current)
-    if (el === undefined) return
+    const root = wrapRef.current
+    if (el === undefined || root === null) return
     suppressFollow(450)
-    el.scrollIntoView({ block: 'start', behavior: 'auto' })
+    scrollChildIntoView(root, el, 'start')
   }, [scrollToken])
 
   const goPage = useCallback(

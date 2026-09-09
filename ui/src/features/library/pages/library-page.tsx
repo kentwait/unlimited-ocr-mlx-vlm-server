@@ -296,7 +296,9 @@ export function LibraryPage(): React.JSX.Element {
       : null
 
   return (
-    <div className="flex h-screen flex-col overflow-hidden">
+    // Fixed-position root: the document itself can never scroll, so pane
+    // follow-scrolls can't yank the top chrome out of view.
+    <div className="fixed inset-0 flex flex-col overflow-hidden">
       <header className="flex items-center gap-2 border-b border-border px-3 py-2">
         <Button variant="outline" size="sm" onClick={() => void openRoot()}>
           <FolderOpen className="size-4" aria-hidden />
@@ -573,19 +575,35 @@ export function LibraryPage(): React.JSX.Element {
                   : 'No markdown sidecar for this PDF yet. Run OCR.'
             }
           />
-          <div className="border-t border-border px-3 py-1.5 text-xs text-muted-foreground">
-            {spansWarning !== null ? (
-              <span className="text-amber-600 dark:text-amber-400">
-                {spansWarning}
-              </span>
-            ) : selected?.kind === 'pdf' && selected.hasMd ? (
-              `saved: ${markdownPathFor(selected.path)}`
-            ) : (
-              'no sidecar'
-            )}
-          </div>
         </section>
       </div>
+      {/* Permanent full-window status bar: identical chrome in every state
+          (no root / no selection / no sidecar / sidecar), so the layout
+          height never shifts when a PDF with sidecar loads. */}
+      <footer
+        data-testid="status-bar"
+        className="flex shrink-0 items-center gap-3 border-t border-border px-3 py-1.5 text-xs text-muted-foreground"
+      >
+        <span className="min-w-0 flex-1 truncate">
+          {selected?.kind === 'pdf'
+            ? `${selected.name} · page ${String(currentPage)}`
+            : 'no selection'}
+        </span>
+        {spansWarning !== null ? (
+          <span className="shrink-0 text-amber-600 dark:text-amber-400">
+            {spansWarning}
+          </span>
+        ) : selected?.kind === 'pdf' && selected.hasMd ? (
+          <span className="min-w-0 truncate">
+            {`saved: ${markdownPathFor(selected.path)}`}
+            {spans !== null
+              ? ` · ${String([...spans.values()].reduce((n, list) => n + list.length, 0))} spans`
+              : null}
+          </span>
+        ) : (
+          <span className="shrink-0">no sidecar</span>
+        )}
+      </footer>
     </div>
   )
 }

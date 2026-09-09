@@ -6,6 +6,7 @@ import { Code2, Eye } from 'lucide-react'
 import { cn } from '#/lib/cn'
 
 import { pickReadingPage } from '../library.functions'
+import { scrollChildIntoView } from '../scroll'
 import type { FocusSpan, MarkdownChunk, Span } from '../library.schema'
 
 const PAGE_ANCHOR_RE = /<!--\s*ocr:page:(\d+)\s*-->/
@@ -185,9 +186,10 @@ export function MarkdownPane({
     const page = pageForScroll.current
     if (page <= 0) return
     const el = chunkRefs.current.get(page)
-    if (el === undefined) return
+    const root = scrollRef.current
+    if (el === undefined || root === null) return
     suppressFollow(450)
-    el.scrollIntoView({ block: 'start', behavior: 'auto' })
+    scrollChildIntoView(root, el, 'start')
     setActivePage(page)
   }, [scrollToken, syncEnabled, hasAnchors, markdown])
 
@@ -256,8 +258,10 @@ export function MarkdownPane({
     )
     const found = idx !== -1 ? blocks[idx] : undefined
     const target: HTMLElement = found instanceof HTMLElement ? found : chunkEl
+    const root = scrollRef.current
+    if (root === null) return
     suppressFollow(450)
-    target.scrollIntoView({ block: 'center', behavior: 'auto' })
+    scrollChildIntoView(root, target, 'center')
     setActivePage(focusSpan.page)
     if (typeof target.animate === 'function') {
       target.animate(

@@ -372,8 +372,12 @@ async def _parse_pdf_path(
         page_markdowns = [render_markdown(spans, journal) for spans in all_spans]
 
         results: list[PageResult] = []
-        for (page_num, img_path, text, stats, elapsed), spans, md in zip(
-            page_ocr, all_spans, page_markdowns
+        if job is not None and cleanup is not None:
+            # Fresh count for the cleanup stage: clients weight OCR and
+            # checking evenly, so pages_done restarts here (same total).
+            job.pages_done = 0
+        for i, ((page_num, img_path, text, stats, elapsed), spans, md) in enumerate(
+            zip(page_ocr, all_spans, page_markdowns)
         ):
             page_res = PageResult(
                 page=page_num,
@@ -393,6 +397,8 @@ async def _parse_pdf_path(
                 cleaned, cstats = await _run_cleanup(
                     cleanup, text, text_layer, page=page_num, journal=journal
                 )
+                if job is not None:
+                    job.pages_done = i + 1
                 page_res.markdown = cleaned
                 page_res.cleanup_method = cstats.method
                 page_res.cleanup_elapsed_s = round(cstats.elapsed_s, 3)

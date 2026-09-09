@@ -201,6 +201,32 @@ def test_parse_pdf_path_rejects_bad_furniture(client, tmp_path):
         )
 
 
+def test_parse_pdf_path_tracks_cleanup_progress(client, tmp_path):
+    import asyncio
+    import time
+
+    from ocr_server.schemas import InferenceParams, JobStatus
+
+    pdf = tmp_path / "t.pdf"
+    pdf.write_bytes(_pdf_bytes(2))
+    job = JobStatus(job_id="x", status="running", created_at=time.time())
+    resp = asyncio.run(
+        api_mod._parse_pdf_path(
+            pdf,
+            pages="all",
+            dpi=100,
+            params=InferenceParams(prompt="document parsing."),
+            journal="nature",
+            job=job,
+        )
+    )
+    assert resp.journal == "nature"
+    assert job.phase == "cleanup"
+    assert job.pages_total == 2
+    # Fresh per-stage count: every page checked, none beyond the total.
+    assert job.pages_done == 2
+
+
 def test_image_inference_failure_is_500(client, monkeypatch):
     def boom(*args, **kwargs):
         raise RuntimeError("gpu gone")

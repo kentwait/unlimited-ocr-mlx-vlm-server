@@ -22,14 +22,21 @@ from test_api import _pdf_bytes, _png_bytes
 TOKEN = "pipeline-token"
 
 
+def _echo_fragments(self, prompt, max_tokens):
+    """Stub LLM: echo the numbered fragment block back unchanged."""
+    start = prompt.index("<<<FRAGMENTS") + len("<<<FRAGMENTS\n")
+    end = prompt.index("FRAGMENTS>>>")
+    return prompt[start:end].strip(), 5, False
+
+
+def _canonical_output(self, prompt, max_tokens):
+    """Stub LLM: fixed non-fragment output (for reflow paths)."""
+    return "canonical output", 5, False
+
+
 @pytest.fixture()
 def stubbed_llm(monkeypatch):
     monkeypatch.setattr(cleanup_mod.CleanupEngine, "load", lambda self: None)
-    monkeypatch.setattr(
-        cleanup_mod.CleanupEngine,
-        "_generate",
-        lambda self, prompt, max_tokens: ("canonical output", 5, False),
-    )
     yield
 
 
@@ -51,7 +58,10 @@ def client(monkeypatch, stubbed_llm):
     monkeypatch.setattr(api_mod, "_cleanup_engine", None)
 
 
-def test_pdf_pipeline_with_cleanup(client):
+def test_pdf_pipeline_with_cleanup(client, monkeypatch):
+    # Checker echoes fragments: corrected spans == original spans, so the
+    # markdown must be exactly the deterministic render of those spans.
+    monkeypatch.setattr(cleanup_mod.CleanupEngine, "_generate", _echo_fragments)
     r = client.post(
         "/parse/pdf",
         files={"file": ("t.pdf", _pdf_bytes(2), "application/pdf")},
@@ -61,23 +71,53 @@ def test_pdf_pipeline_with_cleanup(client):
     body = r.json()
     assert body["n_pages"] == 2
     page = body["results"][0]
-    assert page["markdown"] == "canonical output"
-    assert page["cleanup_method"] == "ocr-llm-proofread"
-    assert page["corrections"]["formatting_only"] is False
+    assert page["markdown"] == "MOCK(page-0001.png|document parsing.)"
+    assert page["cleanup_method"] == "check-spans-proofread"
+    assert page["corrections"]["formatting_only"] is True
     assert body["furniture"]["template"] is None
+    # Spans are the authoritative output and carry identity.
+    import json as _json
+
+    spans = [_json.loads(line) for line in page["spans_jsonl"].splitlines()]
+    assert spans[0]["id"] == "p1-1"
+    assert spans[0]["text"] == "MOCK(page-0001.png|document parsing.)"
 
 
-def test_image_pipeline_with_cleanup(client):
+def test_pdf_pipeline_applies_checker_corrections(client, monkeypatch):
+    def fix_typo(self, prompt, max_tokens):
+        block = _echo_fragments(self, prompt, max_tokens)[0]
+        return block.replace("MOCK", "MARK"), 5, False
+
+    monkeypatch.setattr(cleanup_mod.CleanupEngine, "_generate", fix_typo)
+    r = client.post(
+        "/parse/pdf",
+        files={"file": ("t.pdf", _pdf_bytes(1), "application/pdf")},
+        data={"pages": "all"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    page = body["results"][0]
+    assert "MARK(page-0001.png" in page["markdown"]
+    import json as _json
+
+    spans = [_json.loads(line) for line in page["spans_jsonl"].splitlines()]
+    assert spans[0]["text"].startswith("MARK(")
+    assert page["corrections"]["formatting_only"] is False
+
+
+def test_image_pipeline_with_cleanup(client, monkeypatch):
+    monkeypatch.setattr(cleanup_mod.CleanupEngine, "_generate", _echo_fragments)
     r = client.post(
         "/parse/image",
         files={"file": ("t.png", _png_bytes(), "image/png")},
     )
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["results"][0]["cleanup_method"] == "ocr-llm-proofread"
+    assert body["results"][0]["cleanup_method"] == "check-spans-proofread"
 
 
-def test_reflow_real_path_with_audit(client):
+def test_reflow_real_path_with_audit(client, monkeypatch):
+    monkeypatch.setattr(cleanup_mod.CleanupEngine, "_generate", _canonical_output)
     r = client.post(
         "/internal/reflow",
         json={
@@ -148,7 +188,8 @@ def test_oversize_upload_rejected(client, monkeypatch):
     assert r.status_code == 413
 
 
-def test_job_flow_with_cleanup_tracks_phase(client):
+def test_job_flow_with_cleanup_tracks_phase(client, monkeypatch):
+    monkeypatch.setattr(cleanup_mod.CleanupEngine, "_generate", _echo_fragments)
     r = client.post(
         "/parse/jobs",
         files={"file": ("t.pdf", _pdf_bytes(2), "application/pdf")},
@@ -163,7 +204,7 @@ def test_job_flow_with_cleanup_tracks_phase(client):
         time.sleep(0.05)
     body = s.json()
     assert body["status"] == "done", body
-    assert body["result"]["results"][0]["cleanup_method"] == "ocr-llm-proofread"
+    assert body["result"]["results"][0]["cleanup_method"] == "check-spans-proofread"
 
 
 def test_infer_defaults_to_holder_engine(client, tmp_path):
@@ -201,9 +242,11 @@ def test_parse_pdf_path_rejects_bad_furniture(client, tmp_path):
         )
 
 
-def test_parse_pdf_path_tracks_cleanup_progress(client, tmp_path):
+def test_parse_pdf_path_tracks_cleanup_progress(client, tmp_path, monkeypatch):
     import asyncio
     import time
+
+    monkeypatch.setattr(cleanup_mod.CleanupEngine, "_generate", _echo_fragments)
 
     from ocr_server.schemas import InferenceParams, JobStatus
 

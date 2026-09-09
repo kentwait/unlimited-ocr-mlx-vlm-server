@@ -8,7 +8,8 @@ from ocr_server.api import _audit_to_corrections
 from ocr_server.cleanup import (
     CleanupEngine,
     audit_corrections,
-    strip_det_markers,
+    format_fragments,
+    parse_numbered_fragments,
 )
 from ocr_server.engine import (
     OcrEngine,
@@ -25,7 +26,6 @@ from ocr_server.spans import (
     parse_spans,
     render_markdown,
     spans_to_jsonl,
-    strip_det_markers as spans_strip,
 )
 
 
@@ -65,10 +65,18 @@ def test_parse_spans_empty_marker_label_falls_back():
     assert spans[0].label == "text"
 
 
+def test_parse_spans_assigns_stable_ids():
+    spans = parse_spans("<|det|>title [0,0,1,1]<|/det|>T<|det|>text [0,2,3,4]<|/det|>B", page=3)
+    assert [s.id for s in spans] == ["p3-1", "p3-2"]
+    # Page-scoped: same layout on another page renumbers by page.
+    assert parse_spans("<|det|>text [0,2,3,4]<|/det|>B", page=3)[0].id == "p3-1"
+
+
 def test_spans_jsonl_round_trip():
-    spans = [Span(page=1, label="title", box=[0, 0, 1, 1], text="T")]
+    spans = parse_spans("<|det|>title [0, 0, 1, 1]<|/det|>T", page=1)
     assert spans[0].to_dict()["text"] == "T"
-    assert '"page": 1' in spans_to_jsonl(spans)
+    line = spans_to_jsonl(spans)
+    assert '"page": 1' in line and '"id": "p1-1"' in line
 
 
 def test_render_markdown_skips_furniture_and_figures():
@@ -113,24 +121,6 @@ def test_render_markdown_drops_structural_labels_per_journal():
         )
     # Unknown journals fall back to the universal set, never to nothing.
     assert "header" in drop_labels_for("cell")
-
-
-def test_strip_helpers():
-    raw = "<|det|>text [0,0,1,1]<|/det|>hi [1, 2]"
-    assert "det" not in spans_strip(raw)
-    assert "det" not in strip_det_markers(raw)
-
-
-def test_strip_det_drops_leftover_markers():
-    raw = "<|det|>text [0,0,1,1]<|/det|>hi\n[12, 34]\n<|note|>\nbye"
-    cleaned = strip_det_markers(raw)
-    assert "[12, 34]" not in cleaned and "<|note|>" not in cleaned
-    assert "hi" in cleaned and "bye" in cleaned
-
-
-def test_strip_det_markers_exact():
-    assert strip_det_markers("<|det|>title [1,2,3,4]<|/det|>Hello") == "Hello"
-    assert strip_det_markers("plain") == "plain"
 
 
 def test_content_words_drops_shorts_and_digits():
@@ -188,8 +178,8 @@ def test_prompt_registry_loads_repo_prompts():
     reg = PromptRegistry()
     reg.load()
     assert reg.loaded
-    out = reg.render("checker_scan", ocr="hi", page=1)
-    assert "hi" in out
+    out = reg.render("checker_scan", fragments="[1]\nhi", page=1)
+    assert "[1]" in out and "hi" in out
     with pytest.raises(RuntimeError):
         reg.render("nope")
 
@@ -198,13 +188,13 @@ def test_prompt_registry_failures(tmp_path):
     reg = PromptRegistry(tmp_path / "missing")
     with pytest.raises(RuntimeError, match="not found"):
         reg.load()
-    tmp_path.joinpath("checker_digital.md").write_text("ok {{ ocr }}")
+    tmp_path.joinpath("checker_digital.md").write_text("ok {{ fragments }}")
     with pytest.raises(RuntimeError, match="missing"):
         PromptRegistry(tmp_path).load()
     tmp_path.joinpath("checker_scan.md").write_text("{% if %}")
     with pytest.raises(RuntimeError, match="syntax"):
         PromptRegistry(tmp_path).load()
-    tmp_path.joinpath("checker_scan.md").write_text("uses {{ nope }} {{ ocr }}")
+    tmp_path.joinpath("checker_scan.md").write_text("uses {{ nope }} {{ fragments }}")
     with pytest.raises(RuntimeError, match="dry-render"):
         PromptRegistry(tmp_path).load()
     tmp_path.joinpath("checker_scan.md").write_text("   \n  ")
@@ -239,19 +229,39 @@ def test_audit_removed_only_edits():
     audit.log_summary("test")  # exercises the no-edit branch
 
 
-def _stubbed_engine(monkeypatch, text="canonical output"):
+def _engine(monkeypatch) -> CleanupEngine:
+    """Engine with a no-op load and repo prompts (no weights needed)."""
     from ocr_server import cleanup as cleanup_mod
     from ocr_server.prompts import PromptRegistry
 
     monkeypatch.setattr(cleanup_mod.CleanupEngine, "load", lambda self: None)
-    monkeypatch.setattr(
-        cleanup_mod.CleanupEngine,
-        "_generate",
-        lambda self, prompt, max_tokens: (text, 5, False),
-    )
     reg = PromptRegistry()
     reg.load()
     return cleanup_mod.CleanupEngine("stub", prompts=reg)
+
+
+def _stub_generate(monkeypatch, output):
+    """Stub the raw LLM output (the full numbered-fragment block)."""
+    from ocr_server import cleanup as cleanup_mod
+
+    monkeypatch.setattr(
+        cleanup_mod.CleanupEngine,
+        "_generate",
+        lambda self, prompt, max_tokens: (output, 5, False),
+    )
+
+
+def _echo_generate(monkeypatch):
+    """Stub that echoes the numbered fragments back unchanged."""
+
+    def echo(self, prompt, max_tokens):
+        start = prompt.index("<<<FRAGMENTS") + len("<<<FRAGMENTS\n")
+        end = prompt.index("FRAGMENTS>>>")
+        return prompt[start:end].strip(), 5, False
+
+    from ocr_server import cleanup as cleanup_mod
+
+    monkeypatch.setattr(cleanup_mod.CleanupEngine, "_generate", echo)
 
 
 def test_cleanup_engine_requires_prompts():
@@ -267,33 +277,175 @@ def test_cleanup_engine_starts_unloaded(monkeypatch):
     assert not CleanupEngine("stub", prompts=reg).loaded
 
 
-def test_cleanup_page_digital_branch(monkeypatch):
-    engine = _stubbed_engine(monkeypatch)
-    text, stats = engine.cleanup_page(
-        "<|det|>text [0,0,1,1]<|/det|>hello world, this is a long enough body",
-        "hello world, this is the publisher text layer " * 10,
+def test_check_spans_corrects_within_spans(monkeypatch):
+    engine = _engine(monkeypatch)
+    _stub_generate(
+        monkeypatch,
+        "[1]\nthe quick brown fox jumps over the lazy dog here now",
     )
-    assert stats.method == "ocr+pymupdf+llm"
-    assert text == "canonical output"
+    spans = [
+        Span(page=1, label="text", box=None, id="p1-1", text="teh quick brown fox jumps over the lazy dog here now")
+    ]
+    checked, stats = engine.check_spans(spans, "the quick brown fox " * 20)
+    assert stats.method == "check-spans-digital"
+    # Identity preserved; only text corrected.
+    assert checked[0].id == "p1-1" and checked[0].label == "text"
+    assert checked[0].text == "the quick brown fox jumps over the lazy dog here now"
+    assert stats.audit is not None and stats.audit.text_layer_backed == ["the"]
 
 
-def test_cleanup_page_degenerate_falls_back(monkeypatch):
-    engine = _stubbed_engine(monkeypatch, text="x")
-    text, _ = engine.cleanup_page("some reasonably long ocr body here", None)
-    assert "some reasonably long" in text
+def test_check_spans_proofread_mode(monkeypatch):
+    engine = _engine(monkeypatch)
+    _echo_generate(monkeypatch)
+    spans = [Span(page=2, label="text", box=None, id="p2-1", text="already fine words here")]
+    checked, stats = engine.check_spans(spans, None)
+    assert stats.method == "check-spans-proofread"
+    assert checked[0].text == "already fine words here"
+    assert stats.audit is not None and stats.audit.formatting_only
+
+
+def test_check_spans_skips_structural_and_empty(monkeypatch):
+    engine = _engine(monkeypatch)
+    seen = {}
+
+    def spy(self, prompt, max_tokens):
+        seen["prompt"] = prompt
+        # Echo back only the one content fragment the engine should send.
+        return "[1]\\nreal content stays", 5, False
+
+    from ocr_server import cleanup as cleanup_mod
+    monkeypatch.setattr(cleanup_mod.CleanupEngine, "_generate", spy)
+    spans = [
+        Span(page=1, label="header", box=None, id="p1-1", text="SPECIAL SECTION"),
+        Span(page=1, label="image", box=None, id="p1-2", text=""),
+        Span(page=1, label="text", box=None, id="p1-3", text="real content stays"),
+    ]
+    checked, _ = engine.check_spans(spans, None)
+    assert "SPECIAL SECTION" not in seen["prompt"]
+    assert seen["prompt"].count("[1]") == 1
+    # Identity: structural and image spans untouched, all ids preserved.
+    assert [s.id for s in checked] == ["p1-1", "p1-2", "p1-3"]
+    assert checked[0].text == "SPECIAL SECTION" and checked[1].text == ""
+
+
+def test_check_spans_no_content_spans_skips_llm(monkeypatch):
+    engine = _engine(monkeypatch)
+
+    def boom(self, prompt, max_tokens):
+        raise AssertionError("LLM must not run without content fragments")
+
+    from ocr_server import cleanup as cleanup_mod
+    monkeypatch.setattr(cleanup_mod.CleanupEngine, "_generate", boom)
+    spans = [
+        Span(page=1, label="header", box=None, id="p1-1", text="SPECIAL SECTION"),
+        Span(page=1, label="image", box=None, id="p1-2", text=""),
+    ]
+    checked, stats = engine.check_spans(spans, None)
+    assert [s.id for s in checked] == ["p1-1", "p1-2"]
+    assert stats.audit is not None and stats.audit.formatting_only
+
+
+def test_check_spans_unparsable_falls_back(monkeypatch):
+    engine = _engine(monkeypatch)
+    _stub_generate(monkeypatch, "I cannot follow the numbered format, sorry.")
+    spans = [Span(page=1, label="text", box=None, id="p1-1", text="original text stays here")]
+    checked, stats = engine.check_spans(spans, None)
+    assert checked[0].text == "original text stays here"
+    assert checked[0].id == "p1-1"
+    assert stats.audit is not None and stats.audit.formatting_only
+
+
+def test_check_spans_rejects_duplicate_numbers(monkeypatch):
+    engine = _engine(monkeypatch)
+    _stub_generate(monkeypatch, "[1]\nfirst corrected\n[1]\nsecond corrected")
+    spans = [
+        Span(page=1, label="text", box=None, id="p1-1", text="first original"),
+        Span(page=1, label="text", box=None, id="p1-2", text="second original"),
+    ]
+    checked, _ = engine.check_spans(spans, None)
+    assert [s.text for s in checked] == ["first original", "second original"]
+
+
+def test_check_spans_empty_fragment_keeps_original(monkeypatch):
+    engine = _engine(monkeypatch)
+    _stub_generate(monkeypatch, "[1]\n[2]\nsecond corrected fragment text")
+    spans = [
+        Span(page=1, label="text", box=None, id="p1-1", text="first original text"),
+        Span(page=1, label="text", box=None, id="p1-2", text="second original text"),
+    ]
+    checked, _ = engine.check_spans(spans, None)
+    assert checked[0].text == "first original text"  # empty correction: original kept
+    assert checked[1].text == "second corrected fragment text"
+
+
+def test_check_spans_degenerate_falls_back(monkeypatch):
+    engine = _engine(monkeypatch)
+    _stub_generate(monkeypatch, "[1]\n.")
+    spans = [Span(page=1, label="text", box=None, id="p1-1", text="a reasonably long original fragment body")]
+    checked, _ = engine.check_spans(spans, None)
+    assert checked[0].text == "a reasonably long original fragment body"
+
+
+def test_format_and_parse_round_trip():
+    spans = [
+        Span(page=1, label="text", box=None, id="p1-1", text="line one\nline two"),
+        Span(page=1, label="text", box=None, id="p1-2", text="second fragment words"),
+    ]
+    block = format_fragments(spans)
+    assert block.startswith("[1]\nline one")
+    frags = parse_numbered_fragments(block, 2)
+    assert frags == {1: "line one\nline two", 2: "second fragment words"}
+
+
+def test_parse_numbered_fragments_keeps_final_fragment_extent():
+    # The last fragment extends to end-of-output; a later "fragment" with
+    # matching text would corrupt a wrong-end slice.
+    block = "[1]\nfirst\n[2]\nsecond\n[3]\nsecond"
+    frags = parse_numbered_fragments(block, 3)
+    assert frags == {1: "first", 2: "second", 3: "second"}
+
+
+def test_merge_audits_sums_counts_and_concatenates_samples():
+    from ocr_server.cleanup import CorrectionAudit, merge_audits
+
+    a = CorrectionAudit(n_words_in=10, n_words_out=11)
+    a.text_layer_backed.append("alpha")
+    a.format_added_words = 1
+    b = CorrectionAudit(n_words_in=5, n_words_out=5)
+    b.invented.append("zzz")
+    b.format_added_words = 2
+    merged = merge_audits([a, b])
+    assert merged.n_words_in == 15 and merged.n_words_out == 16
+    assert merged.text_layer_backed == ["alpha"]
+    assert merged.invented == ["zzz"]
+    assert merged.format_added_words == 3
+    assert not merged.formatting_only
+    assert merge_audits([]).formatting_only
+
+
+def test_parse_numbered_fragments_strictness():
+    assert parse_numbered_fragments("[1]\na\n[2]\nb", 2) == {1: "a", 2: "b"}
+    assert parse_numbered_fragments("[1] inline form", 1) == {1: "inline form"}
+    assert parse_numbered_fragments("[1]\na", 2) is None  # missing number
+    assert parse_numbered_fragments("[1]\na\n[2]\nb\n[3]\nc", 2) is None  # extra
+    assert parse_numbered_fragments("no markers at all", 1) is None
+    # Text is preserved verbatim between markers (whitespace-stripped).
+    assert parse_numbered_fragments("[1]\n  spaced  out  ", 1) == {1: "spaced  out"}
 
 
 def test_reflow_text_variants(monkeypatch):
-    engine = _stubbed_engine(monkeypatch)
+    engine = _engine(monkeypatch)
+    _stub_generate(monkeypatch, "canonical output")
     text, stats = engine.reflow_text("some markdown body here", journal="pmc")
-    assert stats.method == "reflow+checker-proofread"
+    assert stats.method == "reflow+proofread"
     assert text == "canonical output"
-    _, stats = engine.reflow_text(
+    text, stats = engine.reflow_text(
         "some markdown body here",
         journal="pmc",
-        text_layer="publisher layer " * 20,
+        prompt_override="Fix {{journal}}:\n\n{{markdown}}",
     )
-    assert stats.method == "reflow+checker-digital"
+    assert stats.method == "reflow+journal-prompt"
+    assert text == "canonical output"
     text, _ = engine.reflow_text("x" * 100, journal="nature", prompt_override="Q")
     assert text == "x" * 100  # degenerate stub output falls back to input
 

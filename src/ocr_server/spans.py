@@ -9,13 +9,14 @@ The OCR model emits plain text with inline layout markers:
 This module parses those into an explicit intermediate representation — one
 JSON record per detected span:
 
-    {"page": 1, "label": "title", "box": [64, 56, 945, 131], "text": "A global view..."}
+    {"id": "p1-1", "page": 1, "label": "title", "box": [64, 56, 945, 131], "text": "A global view..."}
 
-Pipeline: OCR text -> spans (JSONL) -> markdown. Boxes are in the model's
-0-1000 normalized coordinate space; JSONL preserves layout structure
-losslessly while markdown rendering is a separate deterministic step, so
-formatting churn and content edits can be audited independently. The API can
-expose this JSONL alongside markdown in the future.
+Pipeline: OCR text -> spans (JSONL) -> optional span-wise checking ->
+markdown. Boxes are in the model's 0-1000 normalized coordinate space. Span
+ids are the identity contract downstream (Paperhub renders markdown from
+spans and highlights by id), so they are assigned here and preserved through
+checking. Markdown rendering on the server is a frozen deterministic
+convenience; Paperhub renders its own from the JSONL.
 """
 
 from __future__ import annotations
@@ -38,6 +39,7 @@ class Span:
     label: str
     box: list[int] | None  # [x1, y1, x2, y2] in 0-1000 space; None if unknown
     text: str
+    id: str = ""  # identity contract downstream; assigned by parse_spans
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -76,7 +78,9 @@ def drop_labels_for(journal: str) -> frozenset[str]:
 
 def parse_spans(ocr_text: str, page: int = 1) -> list[Span]:
     """Parse OCR text into spans; unmatched non-marker text becomes plain
-    text records so no content is silently dropped."""
+    text records so no content is silently dropped. Spans get stable ids
+    (`p{page}-{index}`, 1-based within the page) — the identity contract
+    downstream."""
     spans: list[Span] = []
     matched_end = 0
     for m in _DET_SPAN_RE.finditer(ocr_text):
@@ -98,6 +102,8 @@ def parse_spans(ocr_text: str, page: int = 1) -> list[Span]:
         body = _PAGE_RE.sub("", ocr_text).strip()
         if body:  # pragma: no cover - unreachable: any non-blank text yields a span above
             spans.append(Span(page=page, label="text", box=None, text=body))
+    for i, s in enumerate(spans):
+        s.id = f"p{page}-{i + 1}"
     return spans
 
 
@@ -129,8 +135,3 @@ def render_markdown(spans: list["Span"], journal: str = "generic") -> str:
         else:
             parts.append(s.text)
     return "\n\n".join(p for p in parts if p.strip()).strip()
-
-
-def strip_det_markers(ocr_text: str, page: int = 1) -> str:
-    """Render OCR text to markdown via the span intermediate (no markers)."""
-    return render_markdown(parse_spans(ocr_text, page=page))

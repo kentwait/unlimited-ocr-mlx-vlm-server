@@ -102,7 +102,7 @@ def render_pages() -> dict[tuple[int, int], Path]:
 def main() -> None:
     import pymupdf
 
-    from ocr_server.cleanup import strip_det_markers
+    from ocr_server.spans import parse_spans, render_markdown
     from ocr_server.engine import OcrEngine
 
     if not Path(PDF_PATH).is_file():
@@ -134,7 +134,7 @@ def main() -> None:
         )
         elapsed = time.perf_counter() - t1
         (WORK_DIR / f"ocr-raw-{TAG}-p{page_num}-d{dpi}.txt").write_text(raw)
-        cleaned = strip_det_markers(raw)
+        cleaned = render_markdown(parse_spans(raw, page=page_num))
 
         text_layer = doc[page_num - 1].get_text()
         g_ocr = ngrams(raw)

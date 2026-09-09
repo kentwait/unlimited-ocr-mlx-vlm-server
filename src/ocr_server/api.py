@@ -224,26 +224,24 @@ async def _infer_image_path(
         return await anyio.to_thread.run_sync(_run_inference_sync, path, params, engine)
 
 
-def _run_cleanup_sync(
+def _run_span_check_sync(
     cleanup: "CleanupEngine",
-    ocr_text: str,
+    spans: list,
     text_layer: str | None,
-    page: int,
     journal: str = "generic",
 ):
-    return cleanup.cleanup_page(ocr_text, text_layer, page=page, journal=journal)
+    return cleanup.check_spans(spans, text_layer, journal=journal)
 
 
-async def _run_cleanup(
+async def _run_span_check(
     cleanup: "CleanupEngine",
-    ocr_text: str,
+    spans: list,
     text_layer: str | None,
-    page: int = 1,
     journal: str = "generic",
 ):
     async with infer_limiter:
         return await anyio.to_thread.run_sync(
-            _run_cleanup_sync, cleanup, ocr_text, text_layer, page, journal
+            _run_span_check_sync, cleanup, spans, text_layer, journal
         )
 
 
@@ -373,7 +371,7 @@ async def _parse_pdf_path(
 
         results: list[PageResult] = []
         if job is not None and cleanup is not None:
-            # Fresh count for the cleanup stage: clients weight OCR and
+            # Fresh count for the checking stage: clients weight OCR and
             # checking evenly, so pages_done restarts here (same total).
             job.pages_done = 0
         for i, ((page_num, img_path, text, stats, elapsed), spans, md) in enumerate(
@@ -390,16 +388,19 @@ async def _parse_pdf_path(
                 spans_jsonl=spans_to_jsonl(spans),
             )
             if cleanup is not None:
-                # Text layer of THIS page (doc still open); None -> ocr-only path.
+                # Text layer of THIS page (doc still open); None -> proofread path.
                 text_layer = doc[page_num - 1].get_text()
                 if job is not None:
                     job.phase = "cleanup"
-                cleaned, cstats = await _run_cleanup(
-                    cleanup, text, text_layer, page=page_num, journal=journal
+                checked, cstats = await _run_span_check(
+                    cleanup, spans, text_layer, journal=journal
                 )
                 if job is not None:
                     job.pages_done = i + 1
-                page_res.markdown = cleaned
+                # Checked spans are authoritative: markdown is derived from
+                # them so the two can never disagree.
+                page_res.markdown = render_markdown(checked, journal)
+                page_res.spans_jsonl = spans_to_jsonl(checked)
                 page_res.cleanup_method = cstats.method
                 page_res.cleanup_elapsed_s = round(cstats.elapsed_s, 3)
                 page_res.cleanup_early_stop = cstats.early_stop
@@ -514,10 +515,11 @@ async def parse_image(
     cleanup_method = None
     cleanup_elapsed = None
     corrections = None
-    spans_jsonl = None
+    # Spans are the authoritative output; markdown is derived from them.
+    spans = parse_spans(text, page=1)
     if cleanup is not None:
-        cleaned, cstats = await _run_cleanup(cleanup, text, None, journal=journal)
-        text = cleaned
+        checked, cstats = await _run_span_check(cleanup, spans, None, journal=journal)
+        spans = checked
         cleanup_method = cstats.method
         cleanup_elapsed = round(cstats.elapsed_s, 3)
         if cstats.audit is not None:
@@ -532,11 +534,8 @@ async def parse_image(
                 "samples_invented": cstats.audit.invented[:8],
                 "samples_text_layer_backed": cstats.audit.text_layer_backed[:8],
             }
-        spans_jsonl = cstats.spans_jsonl
-    else:
-        from .cleanup import strip_det_markers
-
-        text = strip_det_markers(text)
+    spans_jsonl = spans_to_jsonl(spans)
+    text = render_markdown(spans, journal)
     log.info(
         "image done: ocr %.1fs (%d tok%s), cleanup %s %.1fs, %d chars",
         elapsed,

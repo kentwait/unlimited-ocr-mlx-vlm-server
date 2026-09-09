@@ -88,7 +88,11 @@ def main() -> None:
         ocr = ocr_path.read_text()
         text_layer = doc[page_num - 1].get_text()
 
-        cleaned, stats = eng.cleanup_page(ocr, text_layer, max_tokens=8192)
+        from ocr_server.spans import parse_spans, render_markdown
+
+        spans = parse_spans(ocr, page=page_num)
+        checked, stats = eng.check_spans(spans, text_layer, max_tokens=8192)
+        cleaned = render_markdown(checked, journal="generic")
         g_ocr = ngrams(ocr)
         g_truth = ngrams(text_layer)
         g_out = ngrams(cleaned)

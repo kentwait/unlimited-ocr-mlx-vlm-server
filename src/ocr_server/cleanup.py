@@ -1,19 +1,24 @@
-"""Optional post-OCR cleanup stage.
+"""Optional post-OCR checking stage — operates WITHIN spans.
 
 Pipeline per page:
-  1. deterministic pre-clean of OCR markdown (strip <|det|> markers/coords,
-     drop empty det-only lines, dedupe loop-remnant lines)
-  2. LLM stage (Qwen3.5-0.8B MLX 8-bit via mlx_vlm):
-     - digital pages (text layer >= 200 chars): reconcile OCR structure with
-       the publisher text layer AND proofread (misspellings etc.)
-     - scanned pages: proofread-only prompt — fix obvious OCR misspellings
-       from context; never paraphrase; preserve names/numbers/units
-  3. token-level loop-break (same detector as OCR stage) + long-line dedupe
+  1. OCR output is parsed into spans (see ocr_server.spans); structural
+     labels are excluded.
+  2. Content spans are numbered and sent to the LLM (Qwen3.5-0.8B MLX 8-bit
+     via mlx_vlm) as an ID'd plain-text list:
+     - digital pages (text layer >= 200 chars): reconcile fragment wording
+       against the publisher text layer AND proofread (misspellings etc.)
+     - scanned pages: proofread-only — fix obvious OCR misspellings from
+       context; never paraphrase; preserve names/numbers/units
+  3. The numbered output is parsed strictly: every fragment number must be
+     present exactly once, else the page falls back to the original spans.
 
-Every LLM edit is audited: the checker's input is word-diffed against its
-output, and each changed word is attributed as
+The server never asks the checker for markdown — span texts are corrected
+in place and markdown rendering is downstream (server-side frozen render;
+Paperhub renders its own). Every LLM edit is audited per span: the original
+fragment is word-diffed against the corrected one, and each changed word is
+attributed as
   - text-layer-backed: the replacement exists in the page's text layer
-  - ocr-vocab-backed:  replacement appears elsewhere in the page's own OCR
+  - ocr-vocab-backed:  replacement appears elsewhere in the fragment/page
   - invented:          replacement exists in neither (model "intuition") —
                        the hallucination-risk category, surfaced in logs
 Corrections are logged at INFO per page and summarized in CleanupStats.
@@ -23,38 +28,58 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from .engine import _dedupe_long_lines, _loop_period
 from .prompts import PromptRegistry
-from .spans import parse_spans, render_markdown, spans_to_jsonl
+from .spans import Span, drop_labels_for
 
 log = logging.getLogger("ocr_server")
 
 DEFAULT_CLEANUP_MODEL = "mlx-community/Qwen3.5-0.8B-MLX-8bit"
 
-_DET_RE = re.compile(r"<\|det\|>[^<]*<\|/det\|>")
-_LEFTOVER_BRACKET_RE = re.compile(r"^\s*\[?\d+,\s*\d+(,\s*\d+)*\]?\s*$")
-_MULTIBLANK_RE = re.compile(r"\n{3,}")
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
 _MARKDOWN_RE = re.compile(r"[#*_>`\[\]()\\|⁰¹²³⁴⁵⁶⁷⁸⁹₀₁₂₃₄₅₆₇₈₉]")
 
 
-def strip_det_markers(ocr_text: str) -> str:
-    """Deterministic pre-clean: remove layout markers and coordinate noise."""
-    out = _DET_RE.sub("", ocr_text)
-    lines = []
-    for line in out.splitlines():
-        s = line.strip()
-        if not s or _LEFTOVER_BRACKET_RE.match(s):
-            continue
-        if s.startswith("<|") and s.endswith("|>"):
-            continue
-        lines.append(line)
-    cleaned = "\n".join(lines)
-    cleaned = _MULTIBLANK_RE.sub("\n\n", cleaned)
-    return _dedupe_long_lines(cleaned).strip()
+# ---------------------------------------------------------------------------
+# Numbered-fragment format (the checker's I/O contract)
+# ---------------------------------------------------------------------------
+
+_SPAN_MARK_RE = re.compile(r"^[ \t]*\[(\d+)\][ \t]?", re.MULTILINE)
+
+
+def format_fragments(spans: list[Span]) -> str:
+    """Render spans as the checker's numbered plain-text list: a `[n]`
+    marker line per fragment followed by its text."""
+    lines: list[str] = []
+    for i, s in enumerate(spans, 1):
+        lines.append(f"[{i}]")
+        lines.append(s.text)
+    return "\n".join(lines)
+
+
+def parse_numbered_fragments(output: str, expected: int) -> dict[int, str] | None:
+    """Parse checker output back into `{number: text}`.
+
+    Strict: returns None unless every number in 1..expected appears exactly
+    once (duplicate, missing, or extra numbers mean the model broke the
+    contract — callers fall back to the original spans rather than guess)."""
+    matches = list(_SPAN_MARK_RE.finditer(output))
+    if not matches:
+        return None
+    frags: dict[int, str] = {}
+    for i, m in enumerate(matches):
+        n = int(m.group(1))
+        if n in frags:
+            return None
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(output)
+        frags[n] = output[start:end].strip()
+    if set(frags) != set(range(1, expected + 1)):
+        return None
+    return frags
 
 
 # ---------------------------------------------------------------------------
@@ -180,23 +205,40 @@ def audit_corrections(
     return audit
 
 
+def merge_audits(audits: list[CorrectionAudit]) -> CorrectionAudit:
+    """Aggregate per-span audits into one page-level audit (counts sum,
+    sample lists concatenate)."""
+    merged = CorrectionAudit()
+    for a in audits:
+        merged.n_words_in += a.n_words_in
+        merged.n_words_out += a.n_words_out
+        merged.text_layer_backed.extend(a.text_layer_backed)
+        merged.ocr_vocab_backed.extend(a.ocr_vocab_backed)
+        merged.invented.extend(a.invented)
+        merged.format_removed_words += a.format_removed_words
+        merged.format_added_words += a.format_added_words
+    merged.formatting_only = (
+        merged.format_removed_words == 0 and merged.format_added_words == 0
+    )
+    return merged
+
+
 # ---------------------------------------------------------------------------
 # Cleanup engine
 # ---------------------------------------------------------------------------
 
 @dataclass
 class CleanupStats:
-    method: str  # "ocr+pymupdf+llm" | "ocr-llm-proofread" | "ocr-only"
+    method: str  # "check-spans-digital" | "check-spans-proofread" | "reflow+..."
     elapsed_s: float
     tokens: int | None = None
     early_stop: bool = False
     audit: CorrectionAudit | None = None
-    spans_jsonl: str | None = None  # structured span intermediate (JSONL)
 
 
 class CleanupEngine:
-    """Lazy-loaded small LLM that merges OCR structure with the text layer
-    and proofreads the result."""
+    """Lazy-loaded small LLM that corrects OCR text WITHIN spans (never
+    across them, never into markdown)."""
 
     def __init__(
         self,
@@ -257,54 +299,105 @@ class CleanupEngine:
         text = _dedupe_long_lines(text)
         return text, len(ids), early_stop
 
-    def cleanup_page(
+    def check_spans(
         self,
-        ocr_text: str,
+        spans: list[Span],
         text_layer: str | None,
         max_tokens: int = 6144,
-        page: int = 1,
         journal: str = "generic",
-    ) -> tuple[str, CleanupStats]:
-        """Check/clean one page. Returns (markdown, stats); stats.spans_jsonl
-        carries the structured span intermediate (see ocr_server.spans).
-        The checker input already excludes the journal's structural spans."""
+    ) -> tuple[list[Span], CleanupStats]:
+        """Correct OCR text WITHIN each content span; returns (checked_spans,
+        stats). Identity is preserved: labels, boxes, and span ids survive
+        unchanged — only `text` may differ. Structural labels (per the
+        journal's drop set) and empty fragments are never sent to the model.
+
+        Strict contract: the model must echo every fragment number exactly
+        once. Any violation (or degenerate output) falls back to the
+        original spans — content is never dropped on model misbehavior."""
         import time as _time
 
         t0 = _time.perf_counter()
-        spans = parse_spans(ocr_text, page=page)
-        spans_jsonl = spans_to_jsonl(spans)
-        pre = render_markdown(spans, journal)
+        drop = drop_labels_for(journal)
+        numbered: list[tuple[int, Span]] = [
+            (idx, s)
+            for idx, s in enumerate(spans)
+            if s.label not in drop and s.text.strip()
+        ]
 
+        def originals() -> tuple[list[Span], CleanupStats]:
+            audit = CorrectionAudit()
+            audit.formatting_only = True
+            return list(spans), CleanupStats(
+                method=method,
+                elapsed_s=_time.perf_counter() - t0,
+                audit=audit,
+            )
+
+        page = spans[0].page if spans else 1
         has_text_layer = bool(text_layer) and len(text_layer.strip()) >= 200
         if has_text_layer:
-            method = "ocr+pymupdf+llm"
+            method = "check-spans-digital"
             prompt = self._prompts.render(
-                "checker_digital", ocr=pre, text_layer=(text_layer or "").strip(), page=page
+                "checker_digital",
+                fragments=format_fragments([s for _, s in numbered]),
+                text_layer=(text_layer or "").strip(),
+                page=page,
             )
         else:
-            method = "ocr-llm-proofread"
-            prompt = self._prompts.render("checker_scan", ocr=pre, page=page)
+            method = "check-spans-proofread"
+            prompt = self._prompts.render(
+                "checker_scan",
+                fragments=format_fragments([s for _, s in numbered]),
+                page=page,
+            )
+
+        if not numbered:
+            return originals()
 
         self.load()
         text, n_tokens, early_stop = self._generate(prompt, max_tokens)
-        audit = audit_corrections(pre, text, text_layer if has_text_layer else None)
-
-        # Degenerate output -> fall back to the deterministic markdown render.
-        if len(text) < 0.3 * len(pre):
+        frags = parse_numbered_fragments(text, len(numbered))
+        if frags is None:
             log.warning(
-                "checker output degenerate (%d chars < 30%% of input); "
-                "falling back to deterministic markdown",
-                len(text),
+                "checker output broke the numbered contract (%d fragments "
+                "expected) — keeping original spans",
+                len(numbered),
             )
-            text = pre
+            return originals()
 
-        return text, CleanupStats(
+        corrected = list(spans)
+        audits: list[CorrectionAudit] = []
+        total_in = sum(len(s.text) for _, s in numbered)
+        total_out = 0
+        for i, (idx, s) in enumerate(numbered):
+            new_text = frags[i + 1]
+            if not new_text:
+                continue  # model emptied a fragment: keep the original
+            total_out += len(new_text)
+            if new_text == s.text:
+                continue
+            audits.append(
+                audit_corrections(s.text, new_text, text_layer if has_text_layer else None)
+            )
+            corrected[idx] = replace(s, text=new_text)
+        if total_out < 0.3 * max(1, total_in):
+            log.warning(
+                "checker output degenerate (%d chars < 30%% of input) — "
+                "keeping original spans",
+                total_out,
+            )
+            return originals()
+
+        audit = merge_audits(audits) if audits else CorrectionAudit(
+            formatting_only=True
+        )
+        audit.log_summary(f"page {page}")
+        return corrected, CleanupStats(
             method=method,
             elapsed_s=_time.perf_counter() - t0,
             tokens=n_tokens,
             early_stop=early_stop,
             audit=audit,
-            spans_jsonl=spans_jsonl,
         )
 
     def reflow_text(
@@ -318,15 +411,15 @@ class CleanupEngine:
     ) -> tuple[str, CleanupStats]:
         """LLM reflow pass over client-rendered markdown.
 
-        Unlike cleanup_page (which starts from raw OCR text and the server's
-        own checker prompts), this starts from already-rendered markdown and
-        applies a caller-supplied prompt — the seam Paperhub's journal reflow
-        uses to reuse the resident checker model with client-owned prompts.
+        Unlike check_spans (which corrects WITHIN spans and never produces
+        markdown), this starts from already-rendered markdown and applies a
+        caller-supplied prompt — the seam Paperhub's journal reflow uses to
+        reuse the resident checker model with client-owned prompts.
         `journal` is an opaque label echoed back in stats; the server never
         interprets it. prompt_override supports plain {{markdown}} and
         {{journal}} substitution (deliberately not Jinja: the caller is
         trusted-but-remote, and simple replacement has no template footguns).
-        Without an override the server's proofread prompt applies.
+        Without an override a built-in proofread instruction applies.
         """
         import time as _time
 
@@ -338,18 +431,15 @@ class CleanupEngine:
             )
             method = "reflow+journal-prompt"
         else:
-            has_text_layer = bool(text_layer) and len(text_layer.strip()) >= 200
-            if has_text_layer:
-                method = "reflow+checker-digital"
-                prompt = self._prompts.render(
-                    "checker_digital",
-                    ocr=source,
-                    text_layer=(text_layer or "").strip(),
-                    page=1,
-                )
-            else:
-                method = "reflow+checker-proofread"
-                prompt = self._prompts.render("checker_scan", ocr=source, page=1)
+            method = "reflow+proofread"
+            prompt = (
+                "Correct ONLY obvious OCR errors in the following markdown: "
+                "misspellings, wrong or merged characters, broken words. "
+                "Never paraphrase, never add or remove content; preserve "
+                "every `<!-- ocr:page:N -->` anchor and all markdown/LaTeX "
+                "formatting. Output ONLY the corrected markdown.\n\n"
+                + source
+            )
 
         self.load()
         text, n_tokens, early_stop = self._generate(prompt, max_tokens)

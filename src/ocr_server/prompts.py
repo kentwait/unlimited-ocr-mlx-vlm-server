@@ -28,8 +28,8 @@ PROMPTS_DIR = Path(__file__).resolve().parents[2] / "prompts"
 
 # name -> (filename, required context keys)
 TEMPLATE_SPECS = {
-    "checker_digital": ("checker_digital.md", {"ocr", "text_layer", "page"}),
-    "checker_scan": ("checker_scan.md", {"ocr", "page"}),
+    "checker_digital": ("checker_digital.md", {"fragments", "text_layer", "page"}),
+    "checker_scan": ("checker_scan.md", {"fragments", "page"}),
 }
 
 

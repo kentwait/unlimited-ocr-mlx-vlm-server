@@ -297,6 +297,17 @@ export function LibraryPage(): React.JSX.Element {
 
   return (
     <div className="flex h-screen flex-col overflow-hidden">
+      {/* Overlay title-bar zone: window chrome (traffic lights / caption
+          buttons) floats here, so this strip reserves the space and keeps
+          the window draggable. */}
+      <div
+        data-tauri-drag-region
+        className="flex h-7 shrink-0 cursor-default select-none items-center justify-center"
+      >
+        <span className="text-xs font-medium text-muted-foreground">
+          OCR Library
+        </span>
+      </div>
       <header className="flex items-center gap-2 border-b border-border px-3 py-2">
         <Button variant="outline" size="sm" onClick={() => void openRoot()}>
           <FolderOpen className="size-4" aria-hidden />

@@ -5,6 +5,7 @@ import { convertFileSrc } from '@tauri-apps/api/core'
 import { AlertTriangle, ChevronLeft, ChevronRight, Loader2 } from 'lucide-react'
 
 import { Button } from '#/shared/components/ui/button'
+import { debugFs } from '../library.functions'
 import type { Span, TreeNode } from '../library.schema'
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl
@@ -82,6 +83,23 @@ export function PdfPane({
               ? 'file fetch (library-root scope or missing file)'
               : 'PDF parse'
           setLoadError(`${stage}: ${detail}`)
+          // Annotate with the definitive scope verdict from the Rust layer.
+          void debugFs(pdfNode.path)
+            .then((d) => {
+              if (cancelled || d === null) return
+              const verdict =
+                d.allowed || d.allowedCanonical ? 'scope OK' : 'scope DENIED'
+              const canon =
+                d.canonicalPath !== null && d.canonicalPath !== d.path
+                  ? ` canon=${d.canonicalPath}`
+                  : ''
+              setLoadError((prev) =>
+                prev === null ? prev : `${prev} [${verdict}${canon}]`,
+              )
+            })
+            .catch(() => {
+              // diagnostics are best-effort; the load error above stands
+            })
         }
       })
     return () => {

@@ -1,7 +1,12 @@
 import { invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
 
-import { TreeNodeSchema, type TreeNode } from './library.schema'
+import {
+  TreeNodeSchema,
+  SpanSchema,
+  type Span,
+  type TreeNode,
+} from './library.schema'
 import { isTauriRuntime } from './library.runtime'
 
 /**
@@ -70,4 +75,40 @@ export function markdownPathFor(pdfPath: string): string {
 
 export function spansPathFor(pdfPath: string): string {
   return `${pdfPath.replace(/\.pdf$/i, '')}.spans.jsonl`
+}
+
+export type FsDebug = {
+  path: string
+  canonicalPath: string | null
+  root: string | null
+  allowed: boolean
+  allowedCanonical: boolean
+}
+
+/**
+ * Asks the Rust layer whether the fs scope covers a path (literal and
+ * canonical spellings). Null outside the Tauri runtime. Used to annotate
+ * preview load failures with a definitive scope verdict.
+ */
+export async function debugFs(path: string): Promise<FsDebug | null> {
+  if (!isTauriRuntime()) return null
+  return invoke<FsDebug>('debug_fs', { path })
+}
+
+/**
+ * Parses a spans JSONL sidecar into a per-page map. Throws on malformed
+ * lines — callers decide whether that is fatal (fresh load) or a warning
+ * (post-OCR save keeps its markdown, overlay goes off).
+ */
+export function parseSpansJsonl(jsonl: string): Map<number, Span[]> {
+  const byPage = new Map<number, Span[]>()
+  for (const line of jsonl.split('\n')) {
+    const trimmed = line.trim()
+    if (trimmed.length === 0) continue
+    const span = SpanSchema.parse(JSON.parse(trimmed) as unknown)
+    const list = byPage.get(span.page) ?? []
+    list.push(span)
+    byPage.set(span.page, list)
+  }
+  return byPage
 }

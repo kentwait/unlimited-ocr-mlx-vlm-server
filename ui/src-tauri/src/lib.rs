@@ -110,12 +110,58 @@ fn set_root(app: tauri::AppHandle, state: State<AppState>, path: String) -> Resu
     *state.root.lock().unwrap() = Some(p.clone());
     // Widen the scoped fs plugin so the webview can fetch PDF bytes anywhere
     // under the root (used by the preview pane via convertFileSrc + fetch).
-    // Recursive: paper libraries keep PDFs in subfolders.
+    // Recursive: paper libraries keep PDFs in subfolders. Both the literal
+    // and canonical spellings are allowed: macOS symlinks (/tmp ->
+    // /private/tmp) otherwise fail scope matching silently.
     use tauri_plugin_fs::FsExt;
-    app.fs_scope()
-        .allow_directory(&p, true)
-        .map_err(|e| e.to_string())?;
+    let scope = app.fs_scope();
+    scope.allow_directory(&p, true).map_err(|e| e.to_string())?;
+    if let Ok(canon) = std::fs::canonicalize(&p) {
+        if canon != p {
+            scope
+                .allow_directory(&canon, true)
+                .map_err(|e| e.to_string())?;
+        }
+    }
     Ok(())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FsDebug {
+    path: String,
+    canonical_path: Option<String>,
+    root: Option<String>,
+    allowed: bool,
+    allowed_canonical: bool,
+}
+
+/// Diagnostics for preview load failures: reports whether the fs scope
+/// covers a path (literal and canonical spellings) without reading anything.
+#[tauri::command]
+fn debug_fs(app: tauri::AppHandle, state: State<AppState>, path: String) -> FsDebug {
+    use tauri_plugin_fs::FsExt;
+    let scope = app.fs_scope();
+    let p = PathBuf::from(&path);
+    let canonical = std::fs::canonicalize(&p)
+        .ok()
+        .map(|c| c.to_string_lossy().into_owned());
+    let allowed_canonical = canonical
+        .as_ref()
+        .map(|c| scope.is_allowed(c))
+        .unwrap_or(false);
+    FsDebug {
+        path: path.clone(),
+        canonical_path: canonical,
+        root: state
+            .root
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|r| r.to_string_lossy().into_owned()),
+        allowed: scope.is_allowed(&p),
+        allowed_canonical,
+    }
 }
 
 #[tauri::command]
@@ -184,7 +230,8 @@ pub fn run() {
             get_root,
             list_tree,
             read_text_file,
-            write_text_file
+            write_text_file,
+            debug_fs
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

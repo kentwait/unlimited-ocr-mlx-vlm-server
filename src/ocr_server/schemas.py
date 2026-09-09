@@ -82,3 +82,31 @@ class JobStatus(BaseModel):
     phase: str | None = None  # "ocr" | "cleanup"
     pages_done: int = 0
     pages_total: int | None = None
+
+
+REFLOW_CONTRACT_VERSION = 1
+
+
+class ReflowRequest(BaseModel):
+    """Internal reflow call: client-rendered markdown + caller-owned prompt.
+
+    Served by POST /internal/reflow (undocumented, token + loopback guarded).
+    `journal` is opaque to the server — echoed back, never interpreted.
+    """
+
+    contract_version: int = REFLOW_CONTRACT_VERSION
+    journal: str = Field(default="generic", max_length=64)
+    markdown: str = Field(min_length=1, max_length=100_000)
+    prompt_override: str | None = Field(default=None, max_length=20_000)
+    text_layer: str | None = Field(default=None, max_length=100_000)
+    max_tokens: int = Field(default=6144, ge=16, le=16384)
+
+
+class ReflowResponse(BaseModel):
+    contract_version: int = REFLOW_CONTRACT_VERSION
+    journal: str
+    markdown: str
+    method: str
+    elapsed_s: float
+    model: str | None = None
+    corrections: dict | None = None  # same audit shape as PageResult.corrections

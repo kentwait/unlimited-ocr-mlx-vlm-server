@@ -302,3 +302,68 @@ class CleanupEngine:
             audit=audit,
             spans_jsonl=spans_jsonl,
         )
+
+    def reflow_text(
+        self,
+        markdown: str,
+        *,
+        journal: str = "generic",
+        prompt_override: str | None = None,
+        text_layer: str | None = None,
+        max_tokens: int = 6144,
+    ) -> tuple[str, CleanupStats]:
+        """LLM reflow pass over client-rendered markdown.
+
+        Unlike cleanup_page (which starts from raw OCR text and the server's
+        own checker prompts), this starts from already-rendered markdown and
+        applies a caller-supplied prompt — the seam Paperhub's journal reflow
+        uses to reuse the resident checker model with client-owned prompts.
+        `journal` is an opaque label echoed back in stats; the server never
+        interprets it. prompt_override supports plain {{markdown}} and
+        {{journal}} substitution (deliberately not Jinja: the caller is
+        trusted-but-remote, and simple replacement has no template footguns).
+        Without an override the server's proofread prompt applies.
+        """
+        import time as _time
+
+        t0 = _time.perf_counter()
+        source = markdown.strip()
+        if prompt_override:
+            prompt = prompt_override.replace("{{markdown}}", source).replace(
+                "{{journal}}", journal
+            )
+            method = "reflow+journal-prompt"
+        else:
+            has_text_layer = bool(text_layer) and len(text_layer.strip()) >= 200
+            if has_text_layer:
+                method = "reflow+checker-digital"
+                prompt = self._prompts.render(
+                    "checker_digital",
+                    ocr=source,
+                    text_layer=(text_layer or "").strip(),
+                    page=1,
+                )
+            else:
+                method = "reflow+checker-proofread"
+                prompt = self._prompts.render("checker_scan", ocr=source, page=1)
+
+        self.load()
+        text, n_tokens, early_stop = self._generate(prompt, max_tokens)
+        audit = audit_corrections(source, text, None)
+
+        # Degenerate output -> fall back to the input markdown.
+        if len(text) < 0.3 * len(source):
+            log.warning(
+                "reflow output degenerate (%d chars < 30%% of input); "
+                "falling back to input markdown",
+                len(text),
+            )
+            text = source
+
+        return text, CleanupStats(
+            method=method,
+            elapsed_s=_time.perf_counter() - t0,
+            tokens=n_tokens,
+            early_stop=early_stop,
+            audit=audit,
+        )

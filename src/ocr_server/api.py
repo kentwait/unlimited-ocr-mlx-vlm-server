@@ -7,6 +7,7 @@ serial access to unified memory.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import os
 import platform
@@ -17,7 +18,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import anyio
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, status
 
 from .engine import DEFAULT_MODEL_REF, OcrEngine
 from .fake import FakeEngine
@@ -27,11 +28,14 @@ from .pdfrender import render_pdf_pages
 from .prompts import PROMPTS_DIR as PROMPTS_DIR_DEFAULT, PromptRegistry
 from .spans import parse_spans, render_markdown, spans_to_jsonl
 from .schemas import (
+    REFLOW_CONTRACT_VERSION,
     DocumentParseResponse,
     HealthResponse,
     InferenceParams,
     JobStatus,
     PageResult,
+    ReflowRequest,
+    ReflowResponse,
 )
 from .cleanup import CleanupEngine, DEFAULT_CLEANUP_MODEL
 
@@ -627,6 +631,106 @@ async def job_status(job_id: str) -> JobStatus:
     if job is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown job {job_id}")
     return job
+
+
+# ---------------------------------------------------------------------------
+# Internal reflow endpoint (Paperhub's journal pass over the checker LLM).
+#
+# Deliberately NOT public: excluded from the OpenAPI schema and the README.
+# Guarded by BOTH a per-launch bearer token (OCR_INTERNAL_TOKEN, generated
+# by the Tauri sidecar launcher) and a loopback-only check, so it cannot be
+# reached from the LAN even when the server binds 0.0.0.0 for /parse/*.
+# Reflow jobs share infer_limiter with OCR/cleanup: one MLX user at a time.
+# ---------------------------------------------------------------------------
+
+# "testclient" is Starlette's in-process TestClient harness identity.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "testclient"})
+
+
+def _require_internal_access(request: Request) -> None:
+    token = os.environ.get("OCR_INTERNAL_TOKEN", "").strip()
+    if not token:
+        # Fail closed: with no token configured the endpoint doesn't exist.
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "not found")
+    host = request.client.host if request.client is not None else ""
+    if host not in _LOOPBACK_HOSTS:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "internal endpoint is loopback-only"
+        )
+    scheme, _, presented = request.headers.get("authorization", "").partition(" ")
+    if scheme.lower() != "bearer" or not hmac.compare_digest(presented, token):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid internal token")
+
+
+def _audit_to_corrections(audit) -> dict | None:
+    if audit is None:
+        return None
+    return {
+        "text_layer_backed": len(audit.text_layer_backed),
+        "ocr_vocab_backed": len(audit.ocr_vocab_backed),
+        "invented": len(audit.invented),
+        "formatting_only": audit.formatting_only,
+        "format_added_words": audit.format_added_words,
+        "format_removed_words": audit.format_removed_words,
+        "samples_invented": audit.invented[:8],
+        "samples_text_layer_backed": audit.text_layer_backed[:8],
+    }
+
+
+@app.post("/internal/reflow", response_model=ReflowResponse, include_in_schema=False)
+async def internal_reflow(body: ReflowRequest, request: Request) -> ReflowResponse:
+    """LLM reflow over client-rendered markdown with a caller-owned prompt."""
+    _require_internal_access(request)
+    if body.contract_version != REFLOW_CONTRACT_VERSION:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"unsupported reflow contract_version {body.contract_version} "
+            f"(server speaks {REFLOW_CONTRACT_VERSION}) — bump the pinned "
+            "server or the Paperhub client",
+        )
+    if holder.is_fake or _get_cleanup_engine() is None:
+        # Dev contract path: deterministic echo so Paperhub can exercise the
+        # full reflow round-trip (auth, version, journal echo) without weights.
+        return ReflowResponse(
+            journal=body.journal,
+            markdown=body.markdown.strip(),
+            method="fake-echo",
+            elapsed_s=0.0,
+            model="fake",
+            corrections=None,
+        )
+    from functools import partial
+
+    cleanup = _get_cleanup_engine()
+    assert cleanup is not None  # narrowed above; keeps type-checkers honest
+    t0 = time.perf_counter()
+    async with infer_limiter:
+        text, stats = await anyio.to_thread.run_sync(
+            partial(
+                cleanup.reflow_text,
+                body.markdown,
+                journal=body.journal,
+                prompt_override=body.prompt_override,
+                text_layer=body.text_layer,
+                max_tokens=body.max_tokens,
+            )
+        )
+    log.info(
+        "internal reflow: journal=%s method=%s %.1fs, %d chars -> %d chars",
+        body.journal,
+        stats.method,
+        time.perf_counter() - t0,
+        len(body.markdown),
+        len(text),
+    )
+    return ReflowResponse(
+        journal=body.journal,
+        markdown=text,
+        method=stats.method,
+        elapsed_s=round(time.perf_counter() - t0, 3),
+        model=cleanup.model_ref,
+        corrections=_audit_to_corrections(stats.audit),
+    )
 
 
 @app.get("/")

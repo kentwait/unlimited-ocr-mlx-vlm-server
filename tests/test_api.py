@@ -237,3 +237,55 @@ def test_apply_furniture_none_is_noop():
     assert info["template"] is None
     assert info["removed_total"] == 0
     assert spans[0][0].label == "text"
+
+
+# ---------- internal reflow (token + loopback guarded, undocumented) ----------
+
+_TEST_TOKEN = "test-internal-token"
+
+
+def _reflow(client, body, token=_TEST_TOKEN):
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    return client.post("/internal/reflow", json=body, headers=headers)
+
+
+def test_reflow_missing_token_config_is_404(client, monkeypatch):
+    monkeypatch.delenv("OCR_INTERNAL_TOKEN", raising=False)
+    r = client.post("/internal/reflow", json={"markdown": "# hi"})
+    assert r.status_code == 404
+
+
+def test_reflow_rejects_bad_token(client, monkeypatch):
+    monkeypatch.setenv("OCR_INTERNAL_TOKEN", _TEST_TOKEN)
+    assert _reflow(client, {"markdown": "# hi"}, token="wrong").status_code == 401
+    assert _reflow(client, {"markdown": "# hi"}, token=None).status_code == 401
+
+
+def test_reflow_fake_echo_round_trip(client, monkeypatch):
+    monkeypatch.setenv("OCR_INTERNAL_TOKEN", _TEST_TOKEN)
+    r = _reflow(
+        client,
+        {
+            "contract_version": 1,
+            "journal": "nature",
+            "markdown": "  # Title\n\nBody.  ",
+            "prompt_override": "Reflow for {{journal}}:\n\n{{markdown}}",
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["contract_version"] == 1
+    assert body["journal"] == "nature"
+    assert body["markdown"] == "# Title\n\nBody."
+    assert body["method"] == "fake-echo"
+
+
+def test_reflow_rejects_contract_mismatch(client, monkeypatch):
+    monkeypatch.setenv("OCR_INTERNAL_TOKEN", _TEST_TOKEN)
+    r = _reflow(client, {"contract_version": 999, "markdown": "# hi"})
+    assert r.status_code == 400
+    assert "contract_version" in r.json()["detail"]
+
+
+def test_reflow_hidden_from_openapi(client):
+    assert "/internal/reflow" not in client.get("/openapi.json").json()["paths"]

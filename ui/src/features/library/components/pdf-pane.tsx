@@ -366,7 +366,7 @@ export function PdfPane({
 
   return (
     <div className="flex h-full flex-col" data-testid="pdf-pane">
-      <div className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-3">
+      <div className="flex h-12 shrink-0 items-center gap-2 border-b border-border bg-card px-3">
         {headerLeft}
         <div className="ml-auto flex items-center gap-2">
           <Button

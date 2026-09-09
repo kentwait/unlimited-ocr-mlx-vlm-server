@@ -292,7 +292,7 @@ export function MarkdownPane({
 
   return (
     <div className="flex h-full flex-col" data-testid="markdown-pane">
-      <div className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-3">
+      <div className="flex h-12 shrink-0 items-center gap-2 border-b border-border bg-card px-3">
         <button
           type="button"
           onClick={() => setMode('rendered')}

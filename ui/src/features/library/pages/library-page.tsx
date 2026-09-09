@@ -102,19 +102,24 @@ export function LibraryPage(): React.JSX.Element {
     ocrModel: 'default',
   })
   const [showOptions, setShowOptions] = useState(false)
-  /** Theme override (class on <html>); falls back to the OS preference. */
-  const [theme, setTheme] = useState<'light' | 'dark'>(() => {
+  /** Theme override (class on <html>); falls back to the OS preference.
+   * Initialized to the prerender value ('light') and resolved post-mount
+   * so hydration never mismatches; a head script pre-applies the class to
+   * avoid a first-paint flash (see __root.tsx). */
+  const [theme, setTheme] = useState<'light' | 'dark'>('light')
+  useEffect(() => {
     try {
-      if (typeof window === 'undefined') return 'light'
+      if (typeof window === 'undefined') return
       const saved = window.localStorage.getItem('ocr-ui:theme')
-      if (saved === 'light' || saved === 'dark') return saved
-      return window.matchMedia('(prefers-color-scheme: dark)').matches
-        ? 'dark'
-        : 'light'
+      if (saved === 'light' || saved === 'dark') {
+        setTheme(saved)
+      } else if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
+        setTheme('dark')
+      }
     } catch {
-      return 'light'
+      // storage unavailable — keep the prerender default
     }
-  })
+  }, [])
   useEffect(() => {
     document.documentElement.classList.toggle('dark', theme === 'dark')
     document.documentElement.style.colorScheme = theme
@@ -448,7 +453,7 @@ export function LibraryPage(): React.JSX.Element {
     // Fixed-position root: the document itself can never scroll, so pane
     // follow-scrolls can't yank the top chrome out of view.
     <div className="fixed inset-0 flex flex-col overflow-hidden">
-      <header className="flex items-center gap-2 border-b border-border px-3 py-2">
+      <header className="flex items-center gap-2 border-b border-border bg-card px-3 py-2">
         <Button variant="outline" size="sm" onClick={() => void openRoot()}>
           <FolderOpen className="size-4" aria-hidden />
           Open root…
@@ -613,7 +618,7 @@ export function LibraryPage(): React.JSX.Element {
           height never shifts when a PDF with sidecar loads. */}
       <footer
         data-testid="status-bar"
-        className="flex shrink-0 items-center gap-3 border-t border-border px-3 py-1.5 text-xs text-muted-foreground"
+        className="flex shrink-0 items-center gap-3 border-t border-border bg-card px-3 py-1.5 text-xs text-muted-foreground"
       >
         <Button
           variant="ghost"
@@ -637,9 +642,7 @@ export function LibraryPage(): React.JSX.Element {
             : 'no selection'}
         </span>
         {spansWarning !== null ? (
-          <span className="shrink-0 text-amber-600 dark:text-amber-400">
-            {spansWarning}
-          </span>
+          <span className="shrink-0 text-warning">{spansWarning}</span>
         ) : selected?.kind === 'pdf' && selected.hasMd ? (
           <span className="min-w-0 truncate">
             {`saved: ${markdownPathFor(selected.path)}`}

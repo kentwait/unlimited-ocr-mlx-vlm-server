@@ -25,6 +25,13 @@ function RootDocument({
     <html lang="en">
       <head>
         <HeadContent />
+        {/* Pre-apply the stored/OS theme class before hydration: prevents a
+            first-paint flash and keeps the client init aligned. */}
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `try{var t=localStorage.getItem('ocr-ui:theme');if(t!=='light'&&t!=='dark'){t=matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light'}if(t==='dark'){document.documentElement.classList.add('dark');document.documentElement.style.colorScheme='dark'}}catch(e){}`,
+          }}
+        />
       </head>
       <body>
         {children}

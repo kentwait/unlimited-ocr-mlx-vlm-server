@@ -110,8 +110,8 @@ loaded once at server startup — edit and restart to change.
 
 | file | used for | variables |
 |---|---|---|
-| `prompts/checker_digital.md` | pages with a text layer | `{{ ocr }}`, `{{ text_layer }}`, `{{ page }}` |
-| `prompts/checker_scan.md` | scanned pages (no text layer) | `{{ ocr }}`, `{{ page }}` |
+| `prompts/checker_digital.md` | pages with a text layer | `{{ fragments }}`, `{{ text_layer }}`, `{{ page }}` |
+| `prompts/checker_scan.md` | scanned pages (no text layer) | `{{ fragments }}`, `{{ page }}` |
 
 Rules: templates are passed to the model verbatim (write them as Markdown —
 headers/fences are fine); every variable is required (`StrictUndefined` — a
@@ -146,10 +146,14 @@ Both return `{kind, n_pages, results: [{page, markdown, elapsed_s, tokens, tps,
 peak_memory_gb, early_stop, cleanup_method, cleanup_elapsed_s, cleanup_early_stop,
 corrections, spans_jsonl}], total_elapsed_s}`.
 
-- **`spans_jsonl`** — the structured OCR intermediate: one JSON record per
-  detected span, `{"page", "label" (title/text/image/…), "box" ([x1,y1,x2,y2]
-  in the model's 0–1000 space), "text"}`. Markdown is rendered deterministically
-  from these spans; consume the JSONL directly if you want boxes/labels.
+- **`spans_jsonl`** — the authoritative OCR output: one JSON record per
+  detected span, `{"id" ("p{page}-{index}", stable identity), "page",
+  "label" (title/text/image/…), "box" ([x1,y1,x2,y2] in the model's
+  0–1000 space), "text"}`. The checker corrects text WITHIN spans (never
+  across them, never into markdown), so this JSONL already reflects the
+  checker's work and downstream consumers should prefer it over the
+  markdown field. `markdown` is a frozen deterministic render of these
+  spans kept for generic API consumers.
 - **`corrections`** — what the checker changed, content vs formatting:
   `{text_layer_backed, ocr_vocab_backed, invented, formatting_only,
   format_added_words, format_removed_words, samples_invented,

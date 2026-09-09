@@ -82,7 +82,11 @@ export function LibraryPage(): React.JSX.Element {
   const [spansWarning, setSpansWarning] = useState<string | null>(null)
   const [currentPage, setCurrentPage] = useState(1)
   const [focusSpan, setFocusSpan] = useState<FocusSpan | null>(null)
+  // Directional follow-tokens: each pane anchors only on ITS token, so a
+  // pane never scrolls itself. PDF-track bumps mdToken, markdown-observe
+  // bumps pdfToken, explicit jumps bump both.
   const [scrollToken, setScrollToken] = useState(0)
+  const [pdfToken, setPdfToken] = useState(0)
   const [leftW, setLeftW] = useState(() => loadPaneWidth('ocr-ui:leftW', 288))
   const [rightW, setRightW] = useState(() =>
     loadPaneWidth('ocr-ui:rightW', 420),
@@ -106,6 +110,7 @@ export function LibraryPage(): React.JSX.Element {
     setFocusSpan(null)
     setCurrentPage(page)
     setScrollToken((t) => t + 1)
+    setPdfToken((t) => t + 1)
   }, [])
 
   /** Overlay click: focus the matching markdown section (page already set). */
@@ -114,11 +119,25 @@ export function LibraryPage(): React.JSX.Element {
     setFocusSpan({ page: span.page, snippet: span.text, nonce: Date.now() })
   }, [])
 
-  /** Markdown-originated position: moves state only (never scrolls PDF). */
-  const handleVisiblePage = useCallback((_page: number, span: Span | null) => {
-    const page = span?.page ?? _page
-    if (pageMirror.current !== page) setCurrentPage(page)
+  /** PDF scroll tracking: markdown anchors to the new page. */
+  const handlePdfTrack = useCallback((page: number) => {
+    if (pageMirror.current !== page) {
+      setCurrentPage(page)
+      setScrollToken((t) => t + 1)
+    }
   }, [])
+
+  /** Markdown scroll position: PDF anchors to the span's page. */
+  const handleMdVisible = useCallback(
+    (_page: number, span: Span | null) => {
+      const page = span?.page ?? _page
+      if (pageMirror.current !== page) {
+        setCurrentPage(page)
+        setPdfToken((t) => t + 1)
+      }
+    },
+    [],
+  )
 
   const loadTree = useCallback(async (rootPath: string) => {
     setTreeError(null)
@@ -488,9 +507,9 @@ export function LibraryPage(): React.JSX.Element {
             <PdfPane
               pdfNode={selected}
               currentPage={currentPage}
-              onTrackPage={(page) => handleVisiblePage(page, null)}
+              onTrackPage={handlePdfTrack}
               onJumpPage={goPdfPage}
-              scrollToken={scrollToken}
+              scrollToken={pdfToken}
               spansByPage={spans}
               syncEnabled={syncEnabled}
               onSpanClick={handleSpanClick}
@@ -522,7 +541,7 @@ export function LibraryPage(): React.JSX.Element {
             onChunkClick={goPdfPage}
             scrollToken={scrollToken}
             focusSpan={focusSpan}
-            onVisiblePage={handleVisiblePage}
+            onVisiblePage={handleMdVisible}
             onJumpPage={goPdfPage}
             spansByPage={spans}
             emptyHint={

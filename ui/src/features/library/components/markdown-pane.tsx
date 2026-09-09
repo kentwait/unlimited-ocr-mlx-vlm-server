@@ -5,9 +5,39 @@ import { Code2, Eye } from 'lucide-react'
 
 import { cn } from '#/lib/cn'
 
-import type { MarkdownChunk } from '../library.schema'
+import type { FocusSpan, MarkdownChunk } from '../library.schema'
 
 const PAGE_ANCHOR_RE = /<!--\s*ocr:page:(\d+)\s*-->/
+
+/** Normalizes text for fuzzy matching (case/whitespace-insensitive). */
+export function normalizeSnippetText(value: string | null | undefined): string {
+  if (value === null || value === undefined) return ''
+  return value.toLowerCase().replace(/\s+/g, ' ').trim()
+}
+
+/**
+ * Finds the first block whose normalized text contains a long prefix of the
+ * normalized snippet. Tries 64/48/32-char probes so checker rewrites still
+ * match; returns -1 when the snippet is too short or nothing matches.
+ */
+export function findSnippetBlock(
+  blockTexts: string[],
+  snippet: string,
+): number {
+  const needle = normalizeSnippetText(snippet)
+  if (needle.length < 16) return -1
+  const probes = [64, 48, 32]
+    .filter((len) => needle.length >= len)
+    .map((len) => needle.slice(0, len))
+  const candidates = probes.length > 0 ? probes : [needle]
+  for (const probe of candidates) {
+    const idx = blockTexts.findIndex((text) =>
+      normalizeSnippetText(text).includes(probe),
+    )
+    if (idx !== -1) return idx
+  }
+  return -1
+}
 
 /**
  * Splits the document markdown on page anchors into ordered chunks.
@@ -60,7 +90,7 @@ function ChunkView({
   return (
     <div ref={ref} data-page={chunk.page} className="mb-6">
       {rendered ? (
-        <div className="markdown-body prose-sm">
+        <div className="markdown-body prose prose-sm max-w-none dark:prose-invert">
           <ReactMarkdown remarkPlugins={[remarkGfm]}>
             {chunk.content}
           </ReactMarkdown>
@@ -78,6 +108,18 @@ type MarkdownPaneProps = {
   markdown: string | null
   currentPage: number
   syncEnabled: boolean
+  /** Markdown -> PDF: clicking a page chunk jumps the preview to that page. */
+  onChunkClick?: (page: number) => void
+  /**
+   * Bumped only by PDF-originated page changes. The pane scrolls to the
+   * current page on token change — never on markdown-driven changes, so
+   * manual scrolling is never yanked.
+   */
+  scrollToken: number
+  /** Section-level focus from overlay clicks (span text snippet). */
+  focusSpan?: FocusSpan | null
+  /** Markdown -> PDF: the most-visible chunk's page while scrolling. */
+  onVisiblePage?: (page: number) => void
   emptyHint: string
 }
 
@@ -86,12 +128,22 @@ export function MarkdownPane({
   markdown,
   currentPage,
   syncEnabled,
+  onChunkClick,
+  scrollToken,
+  focusSpan,
+  onVisiblePage,
   emptyHint,
 }: MarkdownPaneProps): React.JSX.Element {
   const [mode, setMode] = useState<'rendered' | 'source'>('rendered')
   const scrollRef = useRef<HTMLDivElement | null>(null)
   const chunkRefs = useRef<Map<number, HTMLDivElement>>(new Map())
   const [activePage, setActivePage] = useState<number | null>(null)
+  // Effect below reads the page for scrollToken-driven scrolling through a
+  // ref so observer-driven page changes don't re-trigger the scroll.
+  const pageForScroll = useRef(currentPage)
+  pageForScroll.current = currentPage
+  const visibleRef = useRef(onVisiblePage)
+  visibleRef.current = onVisiblePage
 
   const chunks = useMemo(
     () => (markdown === null ? null : splitByAnchors(markdown)),
@@ -99,14 +151,77 @@ export function MarkdownPane({
   )
   const hasAnchors = chunks !== null
 
-  // PDF -> markdown: scroll the active page's chunk into view.
+  // PDF -> markdown: scroll the active page's chunk into view. Runs only on
+  // scrollToken (PDF-originated) changes, plus sync/markdown toggles.
   useEffect(() => {
-    if (!syncEnabled || !hasAnchors || currentPage <= 0) return
-    const el = chunkRefs.current.get(currentPage)
+    if (!syncEnabled || !hasAnchors) return
+    const page = pageForScroll.current
+    if (page <= 0) return
+    const el = chunkRefs.current.get(page)
     if (el === undefined) return
     el.scrollIntoView({ block: 'start', behavior: 'smooth' })
-    setActivePage(currentPage)
-  }, [currentPage, syncEnabled, hasAnchors, markdown])
+    setActivePage(page)
+  }, [scrollToken, syncEnabled, hasAnchors, markdown])
+
+  // Markdown -> PDF: report the most-visible chunk while scrolling.
+  useEffect(() => {
+    const root = scrollRef.current
+    if (
+      !syncEnabled ||
+      root === null ||
+      chunks === null ||
+      typeof IntersectionObserver === 'undefined'
+    ) {
+      return
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        let best: { page: number; ratio: number } | null = null
+        for (const entry of entries) {
+          const page = Number(entry.target.getAttribute('data-page'))
+          if (
+            entry.isIntersecting &&
+            Number.isFinite(page) &&
+            (best === null || entry.intersectionRatio > best.ratio)
+          ) {
+            best = { page, ratio: entry.intersectionRatio }
+          }
+        }
+        if (best !== null) visibleRef.current?.(best.page)
+      },
+      { root, threshold: [0.25, 0.5, 0.75] },
+    )
+    for (const el of chunkRefs.current.values()) observer.observe(el)
+    return () => observer.disconnect()
+  }, [chunks, syncEnabled])
+
+  // Overlay -> markdown: scroll to the block matching the span snippet,
+  // flash it, fall back to the chunk top when nothing matches.
+  useEffect(() => {
+    if (focusSpan === null || focusSpan === undefined || !hasAnchors) return
+    const chunkEl = chunkRefs.current.get(focusSpan.page)
+    if (chunkEl === undefined) return
+    const blocks = [
+      ...chunkEl.querySelectorAll('p, li, h1, h2, h3, h4, blockquote, td, pre'),
+    ]
+    const idx = findSnippetBlock(
+      blocks.map((b) => normalizeSnippetText(b.textContent)),
+      focusSpan.snippet,
+    )
+    const found = idx !== -1 ? blocks[idx] : undefined
+    const target: HTMLElement = found instanceof HTMLElement ? found : chunkEl
+    target.scrollIntoView({ block: 'center', behavior: 'smooth' })
+    setActivePage(focusSpan.page)
+    if (typeof target.animate === 'function') {
+      target.animate(
+        [
+          { boxShadow: '0 0 0 2px var(--ring)' },
+          { boxShadow: '0 0 0 0 transparent' },
+        ],
+        { duration: 1400 },
+      )
+    }
+  }, [focusSpan, hasAnchors, markdown])
 
   const registerRef = useCallback((page: number, el: HTMLDivElement | null) => {
     if (el === null) {
@@ -170,11 +285,40 @@ export function MarkdownPane({
           chunks.map((chunk) => (
             <div
               key={chunk.page}
+              role={
+                syncEnabled && onChunkClick !== undefined ? 'button' : undefined
+              }
+              tabIndex={
+                syncEnabled && onChunkClick !== undefined ? 0 : undefined
+              }
+              aria-label={
+                syncEnabled && onChunkClick !== undefined
+                  ? `Show PDF page ${String(chunk.page)}`
+                  : undefined
+              }
+              onClick={
+                syncEnabled && onChunkClick !== undefined
+                  ? () => onChunkClick(chunk.page)
+                  : undefined
+              }
+              onKeyDown={
+                syncEnabled && onChunkClick !== undefined
+                  ? (event) => {
+                      if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault()
+                        onChunkClick(chunk.page)
+                      }
+                    }
+                  : undefined
+              }
               className={cn(
                 'rounded-lg transition-colors',
                 syncEnabled &&
                   activePage === chunk.page &&
                   'bg-primary/5 ring-1 ring-primary/30',
+                syncEnabled &&
+                  onChunkClick !== undefined &&
+                  'cursor-pointer hover:bg-muted/60',
               )}
             >
               <ChunkView
@@ -185,7 +329,13 @@ export function MarkdownPane({
             </div>
           ))
         ) : (
-          <div className={cn(mode !== 'rendered' && 'font-mono text-xs')}>
+          <div
+            className={cn(
+              mode !== 'rendered' && 'font-mono text-xs',
+              mode === 'rendered' &&
+                'prose prose-sm max-w-none dark:prose-invert',
+            )}
+          >
             {mode === 'rendered' ? (
               <ReactMarkdown remarkPlugins={[remarkGfm]}>
                 {markdown}

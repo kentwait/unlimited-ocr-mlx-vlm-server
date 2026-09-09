@@ -23,6 +23,8 @@ type PdfPaneProps = {
   onPageChange: (page: number) => void
   spansForPage: Span[] | null
   syncEnabled: boolean
+  /** Overlay -> markdown: clicking a span box jumps to its section. */
+  onSpanClick?: (span: Span) => void
 }
 
 type CanvasSize = { width: number; height: number }
@@ -34,6 +36,7 @@ export function PdfPane({
   onPageChange,
   spansForPage,
   syncEnabled,
+  onSpanClick,
 }: PdfPaneProps): React.JSX.Element {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const wrapRef = useRef<HTMLDivElement | null>(null)
@@ -157,14 +160,16 @@ export function PdfPane({
   )
 
   // Overlay rects from this page's spans (box normalized 0-1000).
-  const rects: OverlayRect[] = useMemo(() => {
+  // spanIndex links back to spansForPage for click-through.
+  const rects: (OverlayRect & { spanIndex: number })[] = useMemo(() => {
     if (spansForPage === null || canvasSize === null) return []
-    return spansForPage.map((span) => ({
+    return spansForPage.map((span, spanIndex) => ({
       x: (span.box[0] ?? 0) / 1000,
       y: (span.box[1] ?? 0) / 1000,
       w: ((span.box[2] ?? 0) - (span.box[0] ?? 0)) / 1000,
       h: ((span.box[3] ?? 0) - (span.box[1] ?? 0)) / 1000,
       label: span.label,
+      spanIndex,
     }))
   }, [spansForPage, canvasSize])
 
@@ -234,19 +239,36 @@ export function PdfPane({
               aria-label={`PDF page ${String(currentPage)} preview`}
             />
             {syncEnabled
-              ? rects.map((rect, index) => (
-                  <div
-                    key={index}
-                    title={rect.label}
-                    className="pointer-events-none absolute rounded-[2px] border border-primary/50 bg-primary/10"
-                    style={{
-                      left: `${String(rect.x * 100)}%`,
-                      top: `${String(rect.y * 100)}%`,
-                      width: `${String(rect.w * 100)}%`,
-                      height: `${String(rect.h * 100)}%`,
-                    }}
-                  />
-                ))
+              ? rects.map((rect) => {
+                  const span = spansForPage?.[rect.spanIndex]
+                  const clickable =
+                    onSpanClick !== undefined && span !== undefined
+                  return (
+                    <button
+                      key={rect.spanIndex}
+                      type="button"
+                      disabled={!clickable}
+                      title={
+                        span !== undefined
+                          ? `${rect.label}: ${span.text.slice(0, 120)}`
+                          : rect.label
+                      }
+                      aria-label={
+                        clickable
+                          ? `Show markdown for ${rect.label}: ${span.text.slice(0, 80)}`
+                          : rect.label
+                      }
+                      onClick={clickable ? () => onSpanClick(span) : undefined}
+                      className="absolute rounded-[2px] border border-primary/50 bg-primary/10 transition-colors hover:border-primary hover:bg-primary/25 disabled:cursor-default disabled:hover:border-primary/50 disabled:hover:bg-primary/10 enabled:cursor-pointer"
+                      style={{
+                        left: `${String(rect.x * 100)}%`,
+                        top: `${String(rect.y * 100)}%`,
+                        width: `${String(rect.w * 100)}%`,
+                        height: `${String(rect.h * 100)}%`,
+                      }}
+                    />
+                  )
+                })
               : null}
           </div>
         )}

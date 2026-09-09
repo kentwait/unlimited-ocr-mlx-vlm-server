@@ -106,6 +106,16 @@ export type MarkdownChunk = {
   content: string
 }
 
+/**
+ * Section-level focus request: scroll the markdown pane to the block
+ * matching `snippet` on `page`. `nonce` re-triggers repeat selections.
+ */
+export type FocusSpan = {
+  page: number
+  snippet: string
+  nonce: number
+}
+
 /** Parse options the UI exposes (mirrors the OCR server's form fields). */
 export type ParseOptions = {
   dpi: number

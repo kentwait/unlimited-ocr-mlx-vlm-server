@@ -24,18 +24,47 @@ import {
   submitParseJob,
 } from '../library.ocr'
 import {
+  type FocusSpan,
   type ParseJobStatus,
   type ParseOptions,
   type Span,
   type TreeNode,
 } from '../library.schema'
 import { LibraryTree } from '../components/library-tree'
+import { PaneDivider } from '../components/pane-divider'
 import { PdfPane } from '../components/pdf-pane'
 import { MarkdownPane } from '../components/markdown-pane'
 
 type JobState = {
   status: ParseJobStatus
   pdfPath: string
+}
+
+const MIN_PANE_W = 180
+const MAX_PANE_W = 720
+
+function clampPaneWidth(value: number): number {
+  return Math.min(MAX_PANE_W, Math.max(MIN_PANE_W, value))
+}
+
+/** localStorage-backed pane width (SSR-safe: falls back during prerender). */
+function loadPaneWidth(key: string, fallback: number): number {
+  try {
+    if (typeof window === 'undefined') return fallback
+    const raw = window.localStorage.getItem(key)
+    const parsed = raw === null ? NaN : Number(raw)
+    return Number.isFinite(parsed) ? clampPaneWidth(parsed) : fallback
+  } catch {
+    return fallback
+  }
+}
+
+function savePaneWidth(key: string, value: number): void {
+  try {
+    window.localStorage.setItem(key, String(Math.round(value)))
+  } catch {
+    // persistence is best-effort; the drag itself already applied
+  }
 }
 
 /** Full three-pane library UI with toolbar. */
@@ -52,6 +81,12 @@ export function LibraryPage(): React.JSX.Element {
   const [treeError, setTreeError] = useState<string | null>(null)
   const [spansWarning, setSpansWarning] = useState<string | null>(null)
   const [currentPage, setCurrentPage] = useState(1)
+  const [focusSpan, setFocusSpan] = useState<FocusSpan | null>(null)
+  const [scrollToken, setScrollToken] = useState(0)
+  const [leftW, setLeftW] = useState(() => loadPaneWidth('ocr-ui:leftW', 288))
+  const [rightW, setRightW] = useState(() =>
+    loadPaneWidth('ocr-ui:rightW', 420),
+  )
   const [ocrOptions, setOcrOptions] = useState<ParseOptions>({
     dpi: 300,
     pages: 'all',
@@ -60,6 +95,29 @@ export function LibraryPage(): React.JSX.Element {
   })
   const [showOptions, setShowOptions] = useState(false)
   const loadedForPath = useRef<string | null>(null)
+  // Mirror for the markdown-visible-page callback (avoids stale closures).
+  const pageMirror = useRef(currentPage)
+  useEffect(() => {
+    pageMirror.current = currentPage
+  }, [currentPage])
+
+  /** PDF-originated page change: moves preview AND scrolls markdown. */
+  const goPdfPage = useCallback((page: number) => {
+    setFocusSpan(null)
+    setCurrentPage(page)
+    setScrollToken((t) => t + 1)
+  }, [])
+
+  /** Overlay click: focus the matching markdown section (page already set). */
+  const handleSpanClick = useCallback((span: Span) => {
+    setCurrentPage(span.page)
+    setFocusSpan({ page: span.page, snippet: span.text, nonce: Date.now() })
+  }, [])
+
+  /** Markdown-originated page change: moves preview only (no scroll yank). */
+  const handleVisiblePage = useCallback((page: number) => {
+    if (pageMirror.current !== page) setCurrentPage(page)
+  }, [])
 
   const loadTree = useCallback(async (rootPath: string) => {
     setTreeError(null)
@@ -114,6 +172,7 @@ export function LibraryPage(): React.JSX.Element {
   const selectNode = useCallback((node: TreeNode) => {
     setSelected(node)
     setCurrentPage(1)
+    setFocusSpan(null)
     setMarkdown(null)
     setSpans(null)
     setSpansWarning(null)
@@ -378,7 +437,10 @@ export function LibraryPage(): React.JSX.Element {
         </span>
       </header>
       <div className="flex min-h-0 flex-1">
-        <aside className="w-72 shrink-0 overflow-auto border-r border-border">
+        <aside
+          className="shrink-0 overflow-auto border-r border-border"
+          style={{ width: `${String(leftW)}px` }}
+        >
           {treeError !== null ? (
             <div
               role="alert"
@@ -410,14 +472,25 @@ export function LibraryPage(): React.JSX.Element {
             />
           )}
         </aside>
+        <PaneDivider
+          label="Resize library tree"
+          onDrag={(dx) =>
+            setLeftW((w) => {
+              const next = clampPaneWidth(w + dx)
+              savePaneWidth('ocr-ui:leftW', next)
+              return next
+            })
+          }
+        />
         <section className="flex min-w-0 flex-1 flex-col border-r border-border">
           {selected?.kind === 'pdf' ? (
             <PdfPane
               pdfNode={selected}
               currentPage={currentPage}
-              onPageChange={setCurrentPage}
+              onPageChange={goPdfPage}
               spansForPage={spans?.get(currentPage) ?? null}
               syncEnabled={syncEnabled}
+              onSpanClick={handleSpanClick}
             />
           ) : (
             <div className="flex flex-1 items-center justify-center p-6 text-sm text-muted-foreground">
@@ -425,12 +498,28 @@ export function LibraryPage(): React.JSX.Element {
             </div>
           )}
         </section>
-        <section className="flex w-[420px] shrink-0 flex-col">
+        <PaneDivider
+          label="Resize markdown pane"
+          onDrag={(dx) =>
+            setRightW((w) => {
+              const next = clampPaneWidth(w - dx)
+              savePaneWidth('ocr-ui:rightW', next)
+              return next
+            })
+          }
+        />
+        <section
+          className="flex shrink-0 flex-col"
+          style={{ width: `${String(rightW)}px` }}
+        >
           <MarkdownPane
             markdown={markdown}
             currentPage={currentPage}
             syncEnabled={syncEnabled}
-            onChunkClick={setCurrentPage}
+            onChunkClick={goPdfPage}
+            scrollToken={scrollToken}
+            focusSpan={focusSpan}
+            onVisiblePage={handleVisiblePage}
             emptyHint={
               selected === null
                 ? 'Select a PDF to see its markdown.'

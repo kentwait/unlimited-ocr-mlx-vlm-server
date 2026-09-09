@@ -1,4 +1,5 @@
 @import 'tailwindcss';
+@plugin '@tailwindcss/typography';
 
 @theme inline {
   --font-sans: 'Avenir Next', 'Segoe UI', sans-serif;

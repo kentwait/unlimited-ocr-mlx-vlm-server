@@ -19,9 +19,9 @@ runtime and package manager, not the build tool.
 
 ```sh
 bun install
-bun run dev        # vite on http://localhost:1421 (unique per app — the
-                     # 1420 default collides when two Tauri apps run together)
-bun run tauri:dev  # desktop window (runs dev server itself)
+bun run dev        # vite only (port from OCR_UI_PORT, default 1421)
+bun run tauri:dev  # desktop window: probes 1420↑ for a free port, so two
+                   # Tauri apps never share a frontend (see scripts/tauri-dev.ts)
 ```
 
 Point at a non-default server with `VITE_OCR_SERVER_URL`:

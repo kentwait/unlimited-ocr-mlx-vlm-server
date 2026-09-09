@@ -7,9 +7,9 @@
     "#/*": "./src/*"
   },
   "scripts": {
-    "dev": "vite dev --host 127.0.0.1 --port 1421 --strictPort",
+    "dev": "vite dev --host 127.0.0.1 --port ${OCR_UI_PORT:-1421} --strictPort",
     "build": "vite build",
-    "tauri:dev": "tauri dev",
+    "tauri:dev": "bun scripts/tauri-dev.ts",
     "tauri:build": "tauri build",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",

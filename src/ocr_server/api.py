@@ -162,6 +162,10 @@ _CORS_ORIGINS = _CORS_DEFAULT + [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_CORS_ORIGINS,
+    # Dev ports are assigned dynamically (each Tauri app probes from 1420
+    # up — see ui/scripts/tauri-dev.ts), so match the whole loopback range
+    # instead of enumerating ports. Production Tauri origins are exact above.
+    allow_origin_regex=r"http://(localhost|127\.0\.0\.1):14\d\d",
     allow_methods=["*"],
     allow_headers=["*"],
 )

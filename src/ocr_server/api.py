@@ -21,8 +21,10 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 
 from .engine import DEFAULT_MODEL_REF, OcrEngine
 from .fake import FakeEngine
+from .furniture import apply_furniture
 from .pages import parse_pages_spec
 from .pdfrender import render_pdf_pages
+from .spans import parse_spans, render_markdown, spans_to_jsonl
 from .schemas import (
     DocumentParseResponse,
     HealthResponse,
@@ -213,6 +215,7 @@ async def _parse_pdf_path(
     dpi: int,
     params: InferenceParams,
     ocr_model: str | None = None,
+    furniture: str = "auto",
 ) -> DocumentParseResponse:
     """Open, render, and OCR a PDF file. Caller owns cleanup of `path`."""
     import pymupdf
@@ -246,19 +249,44 @@ async def _parse_pdf_path(
 
     cleanup = _get_cleanup_engine()
     engine = holder.get_ocr_engine(ocr_model)
-    results: list[PageResult] = []
+
+    # Furniture pass needs the whole document's OCR first (cross-page
+    # fingerprints + template detection), so run OCR for all pages, then
+    # process.
+    page_ocr: list[tuple[int, Path, str, object, float]] = []
     total0 = time.perf_counter()
     try:
         for page_num, img_path in zip(page_nums, rendered):
             text, stats, elapsed = await _infer_image_path(img_path, params, engine)
+            page_ocr.append((page_num, img_path, text, stats, elapsed))
+
+        # Furniture removal on the span intermediate (template auto-detect or
+        # forced via the `furniture` field; "none" disables).
+        all_spans = [parse_spans(t, page=n) for n, _, t, _, _ in page_ocr]
+        finfo = apply_furniture(all_spans, template=furniture)
+        doc_furniture = {
+            "template": finfo["template"],
+            "removed_total": finfo["removed_total"],
+            "removed_by_page": {
+                n: c for (n, _, _, _, _), c in zip(page_ocr, finfo["removed_by_page"])
+            },
+            "samples": finfo["samples"],
+        }
+        page_markdowns = [render_markdown(spans) for spans in all_spans]
+
+        results: list[PageResult] = []
+        for (page_num, img_path, text, stats, elapsed), spans, md in zip(
+            page_ocr, all_spans, page_markdowns
+        ):
             page_res = PageResult(
                 page=page_num,
-                markdown=text,
+                markdown=md,
                 elapsed_s=round(elapsed, 3),
                 tokens=getattr(stats, "tokens", None),
                 tps=round(getattr(stats, "tps", 0.0) or 0.0, 1) or None,
                 peak_memory_gb=round(getattr(stats, "peak_memory_gb", 0.0) or 0.0, 2) or None,
                 early_stop=bool(getattr(stats, "early_stop", False)),
+                spans_jsonl=spans_to_jsonl(spans),
             )
             if cleanup is not None:
                 # Text layer of THIS page (doc still open); None -> ocr-only path.
@@ -281,14 +309,14 @@ async def _parse_pdf_path(
                         "samples_invented": audit.invented[:8],
                         "samples_text_layer_backed": audit.text_layer_backed[:8],
                     }
-                page_res.spans_jsonl = cstats.spans_jsonl
             log.info(
-                "page %d/%d done: ocr %.1fs (%d tok%s), cleanup %s %.1fs, %d chars",
+                "page %d/%d done: ocr %.1fs (%d tok%s), furniture %d, cleanup %s %.1fs, %d chars",
                 page_num,
                 len(page_nums),
                 elapsed,
                 getattr(stats, "tokens", 0) or 0,
                 ", early-stop" if getattr(stats, "early_stop", False) else "",
+                doc_furniture["removed_by_page"].get(page_num, 0),
                 page_res.cleanup_method or "off",
                 page_res.cleanup_elapsed_s or 0.0,
                 len(page_res.markdown),
@@ -304,6 +332,7 @@ async def _parse_pdf_path(
         n_pages=len(results),
         results=results,
         total_elapsed_s=round(total_elapsed, 3),
+        furniture=doc_furniture,
     )
     # Response summary: aggregate correction stats across pages.
     tot_edits = sum(
@@ -315,12 +344,14 @@ async def _parse_pdf_path(
     tot_inv = sum((r.corrections or {}).get("invented", 0) for r in results)
     log.info(
         "request summary: %d pages in %.1fs (%.1f s/page avg) | checker edits: %d "
-        "total, %d invented | ocr_model=%s dpi=%d",
+        "total, %d invented | furniture: template=%s removed=%d | ocr_model=%s dpi=%d",
         len(results),
         total_elapsed,
         total_elapsed / max(1, len(results)),
         tot_edits,
         tot_inv,
+        doc_furniture["template"],
+        doc_furniture["removed_total"],
         ocr_model or "default",
         dpi,
     )
@@ -445,6 +476,7 @@ async def parse_pdf(
     image_size: int = Form(640),
     cropping: bool = Form(True),
     ocr_model: str = Form("default"),
+    furniture: str = Form("auto"),
 ) -> DocumentParseResponse:
     """Parse a PDF to markdown. `pages` = "all" | "1-3,5". One OCR call per page.
 
@@ -454,7 +486,9 @@ async def parse_pdf(
     params = _params_from_form(prompt, max_tokens, temperature, base_size, image_size, cropping)
     path = await _save_upload(file, ".pdf")
     try:
-        return await _parse_pdf_path(path, pages=pages, dpi=dpi, params=params, ocr_model=ocr_model)
+        return await _parse_pdf_path(
+            path, pages=pages, dpi=dpi, params=params, ocr_model=ocr_model, furniture=furniture
+        )
     finally:
         path.unlink(missing_ok=True)
 
@@ -471,6 +505,7 @@ async def parse_pdf_async(
     image_size: int = Form(640),
     cropping: bool = Form(True),
     ocr_model: str = Form("default"),
+    furniture: str = Form("auto"),
 ) -> JobStatus:
     """Submit a PDF parse as a background job (returns immediately with job_id)."""
     params = _params_from_form(prompt, max_tokens, temperature, base_size, image_size, cropping)
@@ -489,7 +524,9 @@ async def parse_pdf_async(
         job.started_at = time.time()
         job.status = "running"
         try:
-            resp = await _parse_pdf_path(path, pages=pages, dpi=dpi, params=params, ocr_model=ocr_model)
+            resp = await _parse_pdf_path(
+                path, pages=pages, dpi=dpi, params=params, ocr_model=ocr_model, furniture=furniture
+            )
             job.status = "done"
             job.result = resp
         except HTTPException as exc:

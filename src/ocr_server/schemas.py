@@ -56,6 +56,7 @@ class DocumentParseResponse(BaseModel):
     n_pages: int
     results: list[PageResult]
     total_elapsed_s: float
+    furniture: dict | None = None  # {template, removed_total, removed_by_page, samples}
 
 
 class HealthResponse(BaseModel):

@@ -25,7 +25,7 @@ import re
 from dataclasses import asdict, dataclass
 
 _DET_SPAN_RE = re.compile(
-    r"<\|det\|>\s*(?P<label>[\w ]*?)\s*\[(?P<box>[\d,\s]*)\]\s*"
+    r"(?:<\|det\|>\s*)?(?P<label>[\w ]*?)\s*\[(?P<box>[\d,\s]*)\]\s*"
     r"<\|/det\|>(?P<text>.*?)(?=<\|det\|>|\Z)",
     re.DOTALL,
 )
@@ -75,10 +75,16 @@ def spans_to_jsonl(spans: list[Span]) -> str:
     return "\n".join(json.dumps(s.to_dict(), ensure_ascii=False) for s in spans)
 
 
-def render_markdown(spans: list[Span]) -> str:
-    """Deterministic markdown rendering of spans (the formatting step)."""
+def render_markdown(spans: list["Span"]) -> str:
+    """Deterministic markdown rendering of spans (the formatting step).
+
+    Skips furniture spans (relabeled by the furniture pass) and image spans;
+    titles become headings; everything else renders as plain paragraphs.
+    """
     parts: list[str] = []
-    for i, s in enumerate(spans):
+    for s in spans:
+        if s.label == "furniture":
+            continue
         if s.label == "image" or not s.text:
             parts.append("*[figure]*")
         elif s.label == "title":

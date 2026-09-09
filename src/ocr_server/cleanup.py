@@ -218,6 +218,7 @@ class CleanupEngine:
         return self.model is not None
 
     def load(self) -> None:  # pragma: no cover - downloads/loads MLX weights
+        # pragma: no mutate block - requires MLX weights
         if self.loaded:
             return
         from mlx_vlm import load
@@ -225,6 +226,7 @@ class CleanupEngine:
         self.model, self.processor = load(self.model_ref)
 
     def _generate(self, prompt: str, max_tokens: int) -> tuple[str, int, bool]:  # pragma: no cover - runs the MLX model
+        # pragma: no mutate block - requires MLX weights
         """stream_generate + loop-break; returns (text, n_tokens, early_stop)."""
         import time as _time
 

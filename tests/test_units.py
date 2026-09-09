@@ -57,6 +57,12 @@ def test_parse_spans_empty_and_plain():
     assert parse_spans("   ") == []
     spans = parse_spans("just words")
     assert len(spans) == 1 and spans[0].text == "just words"
+    assert spans[0].label == "text" and spans[0].page == 1  # defaults pinned
+
+
+def test_parse_spans_empty_marker_label_falls_back():
+    spans = parse_spans("<|det|>  [0,0,1,1]<|/det|>x")
+    assert spans[0].label == "text"
 
 
 def test_spans_jsonl_round_trip():
@@ -87,6 +93,17 @@ def test_strip_det_drops_leftover_markers():
     cleaned = strip_det_markers(raw)
     assert "[12, 34]" not in cleaned and "<|note|>" not in cleaned
     assert "hi" in cleaned and "bye" in cleaned
+
+
+def test_strip_det_markers_exact():
+    assert strip_det_markers("<|det|>title [1,2,3,4]<|/det|>Hello") == "Hello"
+    assert strip_det_markers("plain") == "plain"
+
+
+def test_content_words_drops_shorts_and_digits():
+    from ocr_server.cleanup import _content_words
+
+    assert _content_words("answer 42 x") == ["answer"]
 
 
 # ---------- pages ----------

@@ -146,6 +146,7 @@ class OcrEngine:
         return self.model is not None
 
     def load(self) -> None:  # pragma: no cover - downloads/loads MLX weights
+        # pragma: no mutate block - requires MLX weights
         if self.loaded:
             return
         from mlx_vlm import load
@@ -163,6 +164,7 @@ class OcrEngine:
         image_size: int,
         cropping: bool,
     ) -> tuple[str, InferenceStats]:
+        # pragma: no mutate block - requires MLX weights
         if not self.loaded:
             self.load()
         import time as _time

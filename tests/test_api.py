@@ -294,6 +294,22 @@ def test_cleanup_engine_disabled_env(monkeypatch):
     monkeypatch.setattr(api_mod, "_cleanup_engine", None)
 
 
+def test_prompt_registry_loads_once(client, monkeypatch):
+    from ocr_server import api as api_mod
+    from ocr_server.prompts import PromptRegistry
+
+    calls = []
+    orig_load = PromptRegistry.load
+    monkeypatch.setattr(
+        PromptRegistry, "load", lambda self: (calls.append(1), orig_load(self))
+    )
+    monkeypatch.setattr(api_mod, "_prompt_registry", None)
+    api_mod._get_prompt_registry()
+    api_mod._get_prompt_registry()
+    assert len(calls) == 1
+    monkeypatch.setattr(api_mod, "_prompt_registry", None)
+
+
 # ---------- furniture (generic-only; journal templates live in Paperhub) ----------
 
 

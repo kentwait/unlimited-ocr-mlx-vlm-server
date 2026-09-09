@@ -53,3 +53,17 @@ show_missing = true
 skip_covered = false
 # fail_under is enforced by CI/Makefile, not here, so local runs stay fast:
 # make coverage  (fail_under=95; ratchet up, never down)
+
+[tool.mutmut]
+# Manual mutation runs only (`make mutate`), never CI.
+source_paths = ["src/ocr_server"]
+# The mutant sandbox copies source+tests only; prompts/ must ride along
+# (PromptRegistry resolves it relative to the package files).
+also_copy = ["prompts/"]
+# fake.py is a dev-only test double: mutating the stub is noise, and its
+# observable behavior is pinned by the API contract tests instead.
+do_not_mutate = ["src/ocr_server/fake.py"]
+# Log-call lines are not behavior: no test asserts log text, and message
+# mutants only add noise to triage.
+do_not_mutate_patterns = ["^\\s*log\\.(debug|info|warning|error|exception)\\("]
+# Weight-only functions carry `# pragma: no mutate block` at the definition.

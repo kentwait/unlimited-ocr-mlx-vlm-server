@@ -19,6 +19,7 @@ import {
 import {
   assembleMarkdown,
   getHealth,
+  getOcrBaseUrl,
   pollJobUntilDone,
   submitParseJob,
 } from '../library.ocr'
@@ -351,18 +352,30 @@ export function LibraryPage(): React.JSX.Element {
         </label>
         <span
           role="status"
-          aria-label={
-            health === 'ok' ? 'OCR server reachable' : 'OCR server unreachable'
-          }
-          className={cn(
-            'size-2 rounded-full',
-            health === 'ok'
-              ? 'bg-primary'
-              : health === 'checking'
-                ? 'bg-muted-foreground/40'
-                : 'bg-destructive',
+          aria-label={`OCR server ${getOcrBaseUrl()} ${health === 'ok' ? 'reachable' : 'unreachable'}`}
+          title={getOcrBaseUrl()}
+          className="ml-2 inline-flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground"
+        >
+          server {getOcrBaseUrl()} ·{' '}
+          {health === 'ok' ? (
+            <span className="font-medium text-primary">connected</span>
+          ) : health === 'checking' ? (
+            <span>connecting…</span>
+          ) : (
+            <span className="font-medium text-destructive">unreachable</span>
           )}
-        />
+          <span
+            aria-hidden
+            className={cn(
+              'size-2 rounded-full',
+              health === 'ok'
+                ? 'bg-primary'
+                : health === 'checking'
+                  ? 'bg-muted-foreground/40'
+                  : 'bg-destructive',
+            )}
+          />
+        </span>
       </header>
       <div className="flex min-h-0 flex-1">
         <aside className="w-72 shrink-0 overflow-auto border-r border-border">

@@ -148,10 +148,11 @@ app = FastAPI(
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 
 _CORS_DEFAULT = [
-    "tauri://localhost",      # Tauri v2 production (macOS/Linux)
+    "tauri://localhost",  # Tauri v2 production (macOS/Linux)
     "http://tauri.localhost",  # Tauri v2 production (Windows)
-    "http://localhost:1420",   # Tauri dev server (create-tauri-app default)
-    "http://localhost:5173",   # vite dev
+    "http://localhost:1420",  # Tauri dev server default (other apps)
+    "http://localhost:1421",  # this app's Tauri dev server (see ui/package.json)
+    "http://localhost:5173",  # vite dev
 ]
 _CORS_ORIGINS = _CORS_DEFAULT + [
     o.strip()

@@ -7,7 +7,7 @@
     "#/*": "./src/*"
   },
   "scripts": {
-    "dev": "vite dev --host 127.0.0.1 --port 1420 --strictPort",
+    "dev": "vite dev --host 127.0.0.1 --port 1421 --strictPort",
     "build": "vite build",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",

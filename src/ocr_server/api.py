@@ -24,6 +24,7 @@ from .fake import FakeEngine
 from .furniture import apply_furniture
 from .pages import parse_pages_spec
 from .pdfrender import render_pdf_pages
+from .prompts import PROMPTS_DIR as PROMPTS_DIR_DEFAULT, PromptRegistry
 from .spans import parse_spans, render_markdown, spans_to_jsonl
 from .schemas import (
     DocumentParseResponse,
@@ -43,6 +44,17 @@ ALLOWED_PDF_TYPES = {"application/pdf", "application/octet-stream"}
 TEMP_DIR = Path("/tmp/unlimited-ocr-server")
 
 _cleanup_engine: CleanupEngine | None = None
+_prompt_registry: PromptRegistry | None = None
+
+
+def _get_prompt_registry() -> PromptRegistry:
+    """Startup-loaded prompt registry singleton (fail-fast at first use)."""
+    global _prompt_registry
+    if _prompt_registry is None:
+        reg = PromptRegistry(os.environ.get("OCR_PROMPTS_DIR", PROMPTS_DIR_DEFAULT))
+        reg.load()
+        _prompt_registry = reg
+    return _prompt_registry
 
 
 def _get_cleanup_engine() -> CleanupEngine | None:
@@ -55,7 +67,7 @@ def _get_cleanup_engine() -> CleanupEngine | None:
         return None
     if _cleanup_engine is None:
         model = os.environ.get("OCR_CLEANUP_MODEL", DEFAULT_CLEANUP_MODEL)
-        _cleanup_engine = CleanupEngine(model)
+        _cleanup_engine = CleanupEngine(model, prompts=_get_prompt_registry())
         log.info("cleanup model configured: %s (loads on first use)", model)
     return _cleanup_engine
 
@@ -117,6 +129,8 @@ _jobs: dict[str, JobStatus] = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Load prompts first: a broken template fails startup before models load.
+    _get_prompt_registry()
     holder.load()
     yield
     holder.engine = None
@@ -178,13 +192,19 @@ async def _infer_image_path(
         return await anyio.to_thread.run_sync(_run_inference_sync, path, params, engine)
 
 
-def _run_cleanup_sync(cleanup: "CleanupEngine", ocr_text: str, text_layer: str | None):
-    return cleanup.cleanup_page(ocr_text, text_layer)
+def _run_cleanup_sync(
+    cleanup: "CleanupEngine", ocr_text: str, text_layer: str | None, page: int
+):
+    return cleanup.cleanup_page(ocr_text, text_layer, page=page)
 
 
-async def _run_cleanup(cleanup: "CleanupEngine", ocr_text: str, text_layer: str | None):
+async def _run_cleanup(
+    cleanup: "CleanupEngine", ocr_text: str, text_layer: str | None, page: int = 1
+):
     async with infer_limiter:
-        return await anyio.to_thread.run_sync(_run_cleanup_sync, cleanup, ocr_text, text_layer)
+        return await anyio.to_thread.run_sync(
+            _run_cleanup_sync, cleanup, ocr_text, text_layer, page
+        )
 
 
 def _params_from_form(
@@ -291,7 +311,7 @@ async def _parse_pdf_path(
             if cleanup is not None:
                 # Text layer of THIS page (doc still open); None -> ocr-only path.
                 text_layer = doc[page_num - 1].get_text()
-                cleaned, cstats = await _run_cleanup(cleanup, text, text_layer)
+                cleaned, cstats = await _run_cleanup(cleanup, text, text_layer, page=page_num)
                 page_res.markdown = cleaned
                 page_res.cleanup_method = cstats.method
                 page_res.cleanup_elapsed_s = round(cstats.elapsed_s, 3)

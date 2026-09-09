@@ -2117,6 +2117,7 @@ source = { editable = "." }
 dependencies = [
     { name = "anyio" },
     { name = "fastapi" },
+    { name = "jinja2" },
     { name = "mlx" },
     { name = "mlx-vlm" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -2142,6 +2143,7 @@ dev = [
 requires-dist = [
     { name = "anyio", specifier = ">=4.4.0" },
     { name = "fastapi", specifier = ">=0.115.0" },
+    { name = "jinja2", specifier = ">=3.1.6" },
     { name = "mlx", specifier = ">=0.20.0" },
     { name = "mlx-vlm", specifier = ">=0.7.0" },
     { name = "numpy", specifier = ">=1.24.0" },

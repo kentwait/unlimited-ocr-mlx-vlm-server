@@ -47,6 +47,7 @@ uv run ocr-server --host 0.0.0.0 --port 8300 \
 | OCR model | `--model-ref` | `OCR_MODEL_REF` | `sahilchachra/unlimited-ocr-mxfp8-mlx` |
 | Cleanup stage | — | `OCR_CLEANUP` | `1` (set `0` to disable) |
 | Cleanup model | — | `OCR_CLEANUP_MODEL` | `mlx-community/Qwen3.5-0.8B-MLX-8bit` |
+| Prompts directory | — | `OCR_PROMPTS_DIR` | `./prompts` (loaded at startup; restart to apply edits) |
 | Stub engine (dev) | `--fake-engine` | `OCR_FAKE_ENGINE=1` | off |
 
 `--model-ref` / `OCR_MODEL_REF` accept any HF repo id or local directory
@@ -92,6 +93,24 @@ uv run python scripts/compare_cleanup.py mlx-community/Qwen3.5-0.8B-MLX-8bit q8
 Run `compare_ocr.py` first — it renders pages and caches raw OCR text that
 `compare_cleanup.py` reuses. Metrics land in `WORK_DIR/ocr-cmp-<tag>.json` and
 `cleanup-cmp-<tag>.json`.
+
+### Prompts (`prompts/*.md`)
+
+The checker LLM's prompts are **Markdown + Jinja2 templates** in `prompts/`,
+loaded once at server startup — edit and restart to change.
+
+| file | used for | variables |
+|---|---|---|
+| `prompts/checker_digital.md` | pages with a text layer | `{{ ocr }}`, `{{ text_layer }}`, `{{ page }}` |
+| `prompts/checker_scan.md` | scanned pages (no text layer) | `{{ ocr }}`, `{{ page }}` |
+
+Rules: templates are passed to the model verbatim (write them as Markdown —
+headers/fences are fine); every variable is required (`StrictUndefined` — a
+misspelled or missing variable is a **startup error**, not an empty string in
+a prompt); each template is dry-rendered at boot, so Jinja syntax errors fail
+the server start with a pointed message. Point `OCR_PROMPTS_DIR` at a
+different directory to experiment with prompt variants without touching the
+repo's.
 
 ## API
 

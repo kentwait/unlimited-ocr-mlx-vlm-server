@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .engine import _dedupe_long_lines, _loop_period
+from .prompts import PromptRegistry
 from .spans import parse_spans, render_markdown, spans_to_jsonl
 
 log = logging.getLogger("ocr_server")
@@ -197,10 +198,20 @@ class CleanupEngine:
     """Lazy-loaded small LLM that merges OCR structure with the text layer
     and proofreads the result."""
 
-    def __init__(self, model_ref: str = DEFAULT_CLEANUP_MODEL):
+    def __init__(
+        self,
+        model_ref: str = DEFAULT_CLEANUP_MODEL,
+        prompts: PromptRegistry | None = None,
+    ):
+        if prompts is None or not prompts.loaded:
+            raise ValueError(
+                "CleanupEngine requires a loaded PromptRegistry "
+                "(server startup loads it; see ocr_server.prompts)"
+            )
         self.model_ref = model_ref
         self.model: Any = None
         self.processor: Any = None
+        self._prompts = prompts
 
     @property
     def loaded(self) -> bool:
@@ -244,48 +255,31 @@ class CleanupEngine:
         text = _dedupe_long_lines(text)
         return text, len(ids), early_stop
 
-    _DIGITAL_PROMPT = """You are cleaning OCR output of one page of an academic paper.
-
-OCR MARKDOWN (structure hints; may contain garbled or repeated fragments):
-<<<OCR
-{pre}
-OCR>>>
-
-PDF TEXT LAYER (exact words from the publisher, ground truth for wording and numbers; reading order may differ):
-<<<TEXT
-{text_layer}
-TEXT>>>
-
-TASK: Produce clean Markdown of the page. The PDF text layer is the source of truth for wording and numbers; use the OCR for structure (headings, figure placement) and for anything missing from the text layer. Also fix OCR misspellings using the text layer. Keep section headings as Markdown headings. Do not invent content. Output ONLY the Markdown."""
-
-    _SCAN_PROMPT = """You are proofreading OCR output of one page of a scanned document.
-
-OCR MARKDOWN:
-<<<OCR
-{pre}
-OCR>>>
-
-TASK: Produce clean Markdown of the page. Fix obvious OCR misspellings and garbled words using context (e.g. "inf1ammation" -> "inflammation", "teh" -> "the"). Keep all wording, names, numbers, and units exactly as recognized — never paraphrase, summarize, or add content. If a word is unrecognizable, keep it as-is. Keep section headings as Markdown headings. Output ONLY the Markdown."""
-
     def cleanup_page(
-        self, ocr_text: str, text_layer: str | None, max_tokens: int = 6144
+        self,
+        ocr_text: str,
+        text_layer: str | None,
+        max_tokens: int = 6144,
+        page: int = 1,
     ) -> tuple[str, CleanupStats]:
         """Check/clean one page. Returns (markdown, stats); stats.spans_jsonl
         carries the structured span intermediate (see ocr_server.spans)."""
         import time as _time
 
         t0 = _time.perf_counter()
-        spans = parse_spans(ocr_text)
+        spans = parse_spans(ocr_text, page=page)
         spans_jsonl = spans_to_jsonl(spans)
         pre = render_markdown(spans)
 
         has_text_layer = bool(text_layer) and len(text_layer.strip()) >= 200
         if has_text_layer:
             method = "ocr+pymupdf+llm"
-            prompt = self._DIGITAL_PROMPT.format(pre=pre, text_layer=(text_layer or "").strip())
+            prompt = self._prompts.render(
+                "checker_digital", ocr=pre, text_layer=(text_layer or "").strip(), page=page
+            )
         else:
             method = "ocr-llm-proofread"
-            prompt = self._SCAN_PROMPT.format(pre=pre)
+            prompt = self._prompts.render("checker_scan", ocr=pre, page=page)
 
         self.load()
         text, n_tokens, early_stop = self._generate(prompt, max_tokens)

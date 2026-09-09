@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { getCurrentWindow } from '@tauri-apps/api/window'
 import { FolderOpen, RefreshCw } from 'lucide-react'
 
 import { Button } from '#/shared/components/ui/button'
 import { cn } from '#/lib/cn'
+import { isTauriRuntime } from '../library.runtime'
 
 import {
   getRoot,
@@ -299,9 +301,45 @@ export function LibraryPage(): React.JSX.Element {
     <div className="flex h-screen flex-col overflow-hidden">
       {/* Overlay title-bar zone: window chrome (traffic lights / caption
           buttons) floats here, so this strip reserves the space and keeps
-          the window draggable. */}
+          the window draggable. Dragging uses an explicit startDragging()
+          call: the data-tauri-drag-region attribute alone is unreliable on
+          macOS with Overlay chrome (upstream Tauri issues #9503/#4316). */}
       <div
         data-tauri-drag-region
+        onMouseDown={(event) => {
+          if (event.button !== 0 || !isTauriRuntime()) return
+          const startX = event.screenX
+          const startY = event.screenY
+          const cleanup = (): void => {
+            window.removeEventListener('mousemove', onMove)
+            window.removeEventListener('mouseup', cleanup)
+          }
+          const onMove = (ev: MouseEvent): void => {
+            // Threshold-guarded: entering the modal drag loop on mousedown
+            // would swallow the second click of a double-click (maximize).
+            if (
+              Math.abs(ev.screenX - startX) > 4 ||
+              Math.abs(ev.screenY - startY) > 4
+            ) {
+              cleanup()
+              void getCurrentWindow()
+                .startDragging()
+                .catch(() => {
+                  // missing capability surfaces in the console, not here
+                })
+            }
+          }
+          window.addEventListener('mousemove', onMove)
+          window.addEventListener('mouseup', cleanup)
+        }}
+        onDoubleClick={() => {
+          if (!isTauriRuntime()) return
+          void getCurrentWindow()
+            .toggleMaximize()
+            .catch(() => {
+              // missing capability surfaces in the console, not here
+            })
+        }}
         className="flex h-7 shrink-0 cursor-default select-none items-center justify-center"
       >
         <span className="text-xs font-medium text-muted-foreground">

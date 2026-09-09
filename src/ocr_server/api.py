@@ -143,6 +143,28 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Allow the desktop UI (Tauri) to call this server cross-origin. Extra origins
+# can be added via OCR_CORS_ORIGINS (comma-separated), e.g. for `vite dev`.
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+
+_CORS_DEFAULT = [
+    "tauri://localhost",      # Tauri v2 production (macOS/Linux)
+    "http://tauri.localhost",  # Tauri v2 production (Windows)
+    "http://localhost:1420",   # Tauri dev server (create-tauri-app default)
+    "http://localhost:5173",   # vite dev
+]
+_CORS_ORIGINS = _CORS_DEFAULT + [
+    o.strip()
+    for o in os.environ.get("OCR_CORS_ORIGINS", "").split(",")
+    if o.strip()
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_CORS_ORIGINS,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 async def _save_upload(upload: UploadFile, suffix: str) -> Path:
     data = await upload.read()
@@ -236,8 +258,13 @@ async def _parse_pdf_path(
     params: InferenceParams,
     ocr_model: str | None = None,
     furniture: str = "auto",
+    job: JobStatus | None = None,
 ) -> DocumentParseResponse:
-    """Open, render, and OCR a PDF file. Caller owns cleanup of `path`."""
+    """Open, render, and OCR a PDF file. Caller owns cleanup of `path`.
+
+    When `job` is given, per-stage progress (phase/pages_done/pages_total) is
+    written to it for client polling.
+    """
     import pymupdf
 
     if not 72 <= dpi <= 300:
@@ -254,6 +281,8 @@ async def _parse_pdf_path(
             page_nums = parse_pages_spec(pages, doc.page_count)
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        if job is not None:
+            job.pages_total = len(page_nums)
         if len(page_nums) > MAX_PAGES:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST,
@@ -279,6 +308,9 @@ async def _parse_pdf_path(
         for page_num, img_path in zip(page_nums, rendered):
             text, stats, elapsed = await _infer_image_path(img_path, params, engine)
             page_ocr.append((page_num, img_path, text, stats, elapsed))
+            if job is not None:
+                job.phase = "ocr"
+                job.pages_done = len(page_ocr)
 
         # Furniture removal on the span intermediate (template auto-detect or
         # forced via the `furniture` field; "none" disables).
@@ -311,6 +343,8 @@ async def _parse_pdf_path(
             if cleanup is not None:
                 # Text layer of THIS page (doc still open); None -> ocr-only path.
                 text_layer = doc[page_num - 1].get_text()
+                if job is not None:
+                    job.phase = "cleanup"
                 cleaned, cstats = await _run_cleanup(cleanup, text, text_layer, page=page_num)
                 page_res.markdown = cleaned
                 page_res.cleanup_method = cstats.method
@@ -545,7 +579,8 @@ async def parse_pdf_async(
         job.status = "running"
         try:
             resp = await _parse_pdf_path(
-                path, pages=pages, dpi=dpi, params=params, ocr_model=ocr_model, furniture=furniture
+                path, pages=pages, dpi=dpi, params=params, ocr_model=ocr_model,
+                furniture=furniture, job=job,
             )
             job.status = "done"
             job.result = resp

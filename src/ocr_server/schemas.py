@@ -77,3 +77,8 @@ class JobStatus(BaseModel):
     created_at: float
     started_at: float | None = None
     finished_at: float | None = None
+    # Client-facing progress (UI polls this): current pipeline phase and
+    # per-page counts. pages_total is None until the pages spec is parsed.
+    phase: str | None = None  # "ocr" | "cleanup"
+    pages_done: int = 0
+    pages_total: int | None = None

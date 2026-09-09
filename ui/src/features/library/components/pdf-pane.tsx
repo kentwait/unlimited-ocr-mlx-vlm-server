@@ -195,9 +195,6 @@ export function PdfPane({
   const [renderError, setRenderError] = useState<string | null>(null)
   const [numPages, setNumPages] = useState(0)
   const [wrapWidth, setWrapWidth] = useState(720)
-  // Last page reported by scroll tracking (diagnostic readout in header).
-  const [tracked, setTracked] = useState<number | null>(null)
-  const trackedRef = useRef<number | null>(null)
   const pageForScroll = useRef(currentPage)
   pageForScroll.current = currentPage
   const trackRef = useRef(onTrackPage)
@@ -323,10 +320,6 @@ export function PdfPane({
       })
     }
     const best = pickReadingPage(entries, root.clientHeight * 0.25)
-    if (best !== trackedRef.current) {
-      trackedRef.current = best
-      setTracked(best)
-    }
     if (best !== null) trackRef.current(best)
   }, [doc])
 
@@ -367,35 +360,36 @@ export function PdfPane({
 
   return (
     <div className="flex h-full flex-col" data-testid="pdf-pane">
-      <div className="flex items-center gap-2 border-b border-border px-3 py-1.5">
-        <Button
-          variant="ghost"
-          size="icon"
-          aria-label="Previous page"
-          disabled={currentPage <= 1}
-          onClick={() => goPage(-1)}
-        >
-          <ChevronLeft className="size-4" aria-hidden />
-        </Button>
-        <span className="text-xs tabular-nums text-muted-foreground">
-          page {numPages === 0 ? '–' : currentPage} / {numPages || '–'}
-          {tracked !== null ? ` · trk ${String(tracked)}` : ''}
-        </span>
-        <Button
-          variant="ghost"
-          size="icon"
-          aria-label="Next page"
-          disabled={currentPage >= numPages}
-          onClick={() => goPage(1)}
-        >
-          <ChevronRight className="size-4" aria-hidden />
-        </Button>
-        {doc === null && loadError === null ? (
-          <Loader2
-            className="size-3.5 animate-spin text-muted-foreground"
-            aria-hidden
-          />
-        ) : null}
+      <div className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-3">
+        <div className="ml-auto flex items-center gap-2">
+          <Button
+            variant="ghost"
+            size="icon"
+            aria-label="Previous page"
+            disabled={currentPage <= 1}
+            onClick={() => goPage(-1)}
+          >
+            <ChevronLeft className="size-4" aria-hidden />
+          </Button>
+          <span className="text-xs tabular-nums text-muted-foreground">
+            page {numPages === 0 ? '–' : currentPage} / {numPages || '–'}
+          </span>
+          <Button
+            variant="ghost"
+            size="icon"
+            aria-label="Next page"
+            disabled={currentPage >= numPages}
+            onClick={() => goPage(1)}
+          >
+            <ChevronRight className="size-4" aria-hidden />
+          </Button>
+          {doc === null && loadError === null ? (
+            <Loader2
+              className="size-3.5 animate-spin text-muted-foreground"
+              aria-hidden
+            />
+          ) : null}
+        </div>
       </div>
       <div
         ref={wrapRef}

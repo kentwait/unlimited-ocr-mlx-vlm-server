@@ -125,8 +125,6 @@ type MarkdownPaneProps = {
    * matched back to its OCR span. Null span = page-level fallback.
    */
   onVisiblePage?: (page: number, span: Span | null) => void
-  /** Page selector in this pane's header (mirrors the PDF pager). */
-  onJumpPage?: (page: number) => void
   /** OCR spans for matching visible blocks back to their span anchor. */
   spansByPage?: Map<number, Span[]> | null
   emptyHint: string
@@ -141,7 +139,6 @@ export function MarkdownPane({
   scrollToken,
   focusSpan,
   onVisiblePage,
-  onJumpPage,
   spansByPage,
   emptyHint,
 }: MarkdownPaneProps): React.JSX.Element {
@@ -291,7 +288,7 @@ export function MarkdownPane({
 
   return (
     <div className="flex h-full flex-col" data-testid="markdown-pane">
-      <div className="flex items-center gap-2 border-b border-border px-3 py-1.5">
+      <div className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-3">
         <button
           type="button"
           onClick={() => setMode('rendered')}
@@ -325,27 +322,8 @@ export function MarkdownPane({
             no page anchors — page sync off
           </span>
         ) : (
-          <span className="ml-auto inline-flex items-center gap-1 text-xs tabular-nums text-muted-foreground">
-            <button
-              type="button"
-              aria-label="Previous markdown page"
-              disabled={currentPage <= (chunks[0]?.page ?? 1)}
-              onClick={() => onJumpPage?.(currentPage - 1)}
-              className="rounded px-1 hover:bg-muted disabled:opacity-40"
-            >
-              ‹
-            </button>
-            page {currentPage} / {chunks[chunks.length - 1]?.page ?? '?'} ·{' '}
+          <span className="ml-auto text-xs tabular-nums text-muted-foreground">
             {chunks.length} pages
-            <button
-              type="button"
-              aria-label="Next markdown page"
-              disabled={currentPage >= (chunks[chunks.length - 1]?.page ?? 1)}
-              onClick={() => onJumpPage?.(currentPage + 1)}
-              className="rounded px-1 hover:bg-muted disabled:opacity-40"
-            >
-              ›
-            </button>
           </span>
         )}
       </div>

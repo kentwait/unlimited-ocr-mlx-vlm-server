@@ -119,22 +119,18 @@ describe('MarkdownPane', () => {
     expect(seen).toEqual([])
   })
 
-  it('jumps pages from the header pager', () => {
-    const seen: number[] = []
+  it('shows the page count without any pager controls', () => {
     render(
       <MarkdownPane
         markdown={DOC}
         currentPage={1}
         syncEnabled={true}
         scrollToken={0}
-        onJumpPage={(page) => seen.push(page)}
         emptyHint="empty"
       />,
     )
-    expect(screen.getByText(/page 1 \/ 2/)).toBeInTheDocument()
-    fireEvent.click(screen.getByLabelText('Next markdown page'))
-    expect(seen).toEqual([2])
-    expect(screen.getByLabelText('Previous markdown page')).toBeDisabled()
+    expect(screen.getByText(/2 pages/)).toBeInTheDocument()
+    expect(screen.queryByLabelText(/markdown page/)).toBeNull()
   })
 })
 

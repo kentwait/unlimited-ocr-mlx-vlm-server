@@ -60,6 +60,13 @@
     border-color: var(--border);
   }
 
+  html,
+  body {
+    height: 100%;
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
+
   html {
     min-width: 320px;
     background: var(--background);

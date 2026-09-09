@@ -42,6 +42,10 @@ type JobState = {
 
 const MIN_PANE_W = 180
 const MAX_PANE_W = 720
+// PDF column floor: below this a full page stops being readable at
+// fit-width scale, so drags must stop here instead of squeezing it.
+const PDF_MIN_W = 420
+const DIVIDER_W = 6 // w-1.5 handles between the three panes
 
 function clampPaneWidth(value: number): number {
   return Math.min(MAX_PANE_W, Math.max(MIN_PANE_W, value))
@@ -99,6 +103,7 @@ export function LibraryPage(): React.JSX.Element {
   })
   const [showOptions, setShowOptions] = useState(false)
   const loadedForPath = useRef<string | null>(null)
+  const panesRef = useRef<HTMLDivElement | null>(null)
   // Mirror for the markdown-visible-page callback (avoids stale closures).
   const pageMirror = useRef(currentPage)
   useEffect(() => {
@@ -291,7 +296,7 @@ export function LibraryPage(): React.JSX.Element {
       : null
 
   return (
-    <div className="flex h-screen flex-col">
+    <div className="flex h-screen flex-col overflow-hidden">
       <header className="flex items-center gap-2 border-b border-border px-3 py-2">
         <Button variant="outline" size="sm" onClick={() => void openRoot()}>
           <FolderOpen className="size-4" aria-hidden />
@@ -453,7 +458,7 @@ export function LibraryPage(): React.JSX.Element {
           />
         </span>
       </header>
-      <div className="flex min-h-0 flex-1">
+      <div ref={panesRef} className="flex min-h-0 flex-1">
         <aside
           className="shrink-0 overflow-auto border-r border-border"
           style={{ width: `${String(leftW)}px` }}
@@ -491,15 +496,27 @@ export function LibraryPage(): React.JSX.Element {
         </aside>
         <PaneDivider
           label="Resize library tree"
-          onDrag={(dx) =>
+          onDrag={(dx) => {
+            const container = panesRef.current?.clientWidth
             setLeftW((w) => {
-              const next = clampPaneWidth(w + dx)
+              let next = w + dx
+              if (container !== undefined) {
+                // Never squeeze the PDF column below its readable floor.
+                next = Math.min(
+                  next,
+                  container - PDF_MIN_W - DIVIDER_W * 2 - rightW,
+                )
+              }
+              next = clampPaneWidth(next)
               savePaneWidth('ocr-ui:leftW', next)
               return next
             })
-          }
+          }}
         />
-        <section className="flex min-w-0 flex-1 flex-col border-r border-border">
+        <section
+          className="flex min-w-0 flex-1 flex-col border-r border-border"
+          style={{ minWidth: `${String(PDF_MIN_W)}px` }}
+        >
           {selected?.kind === 'pdf' ? (
             <PdfPane
               pdfNode={selected}
@@ -519,13 +536,21 @@ export function LibraryPage(): React.JSX.Element {
         </section>
         <PaneDivider
           label="Resize markdown pane"
-          onDrag={(dx) =>
+          onDrag={(dx) => {
+            const container = panesRef.current?.clientWidth
             setRightW((w) => {
-              const next = clampPaneWidth(w - dx)
+              let next = w - dx
+              if (container !== undefined) {
+                next = Math.min(
+                  next,
+                  container - PDF_MIN_W - DIVIDER_W * 2 - leftW,
+                )
+              }
+              next = clampPaneWidth(next)
               savePaneWidth('ocr-ui:rightW', next)
               return next
             })
-          }
+          }}
         />
         <section
           className="flex shrink-0 flex-col"
@@ -539,7 +564,6 @@ export function LibraryPage(): React.JSX.Element {
             scrollToken={scrollToken}
             focusSpan={focusSpan}
             onVisiblePage={handleMdVisible}
-            onJumpPage={goPdfPage}
             spansByPage={spans}
             emptyHint={
               selected === null

@@ -78,13 +78,21 @@ def spans_to_jsonl(spans: list[Span]) -> str:
 def render_markdown(spans: list["Span"]) -> str:
     """Deterministic markdown rendering of spans (the formatting step).
 
-    Skips furniture spans (relabeled by the furniture pass) and image spans;
-    titles become headings; everything else renders as plain paragraphs.
+    Skips furniture spans (relabeled by the furniture pass) and page spans
+    (page-sized duplicates of the finer OCR spans); titles become headings;
+    image spans and empty text become figure markers; everything else
+    renders as plain paragraphs. When a page carries ONLY page spans (the
+    model emitted no finer structure), they render as text so no content
+    is silently dropped.
     """
+    droppable = [s for s in spans if s.label in ("furniture", "page")]
+    if droppable and len(droppable) == len(spans):
+        # No finer structure: keep page text, still drop furniture.
+        renderable = [s for s in spans if s.label == "page"]
+    else:
+        renderable = [s for s in spans if s.label not in ("furniture", "page")]
     parts: list[str] = []
-    for s in spans:
-        if s.label == "furniture":
-            continue
+    for s in renderable:
         if s.label == "image" or not s.text:
             parts.append("*[figure]*")
         elif s.label == "title":

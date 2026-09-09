@@ -82,6 +82,14 @@ def test_render_markdown_skips_furniture_and_figures():
     assert render_markdown(spans) == "# T\n\n*[figure]*\n\nbody"
 
 
+def test_render_markdown_skips_page_duplicates():
+    page = Span(page=1, label="page", box=[0, 0, 1000, 1000], text="whole page")
+    title = Span(page=1, label="title", box=None, text="T")
+    assert render_markdown([page, title]) == "# T"
+    # Page-only output keeps its text: never silently drop content.
+    assert render_markdown([page]) == "whole page"
+
+
 def test_strip_helpers():
     raw = "<|det|>text [0,0,1,1]<|/det|>hi [1, 2]"
     assert "det" not in spans_strip(raw)

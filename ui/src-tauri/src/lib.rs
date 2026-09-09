@@ -108,11 +108,12 @@ fn set_root(app: tauri::AppHandle, state: State<AppState>, path: String) -> Resu
         return Err(format!("not a directory: {}", path));
     }
     *state.root.lock().unwrap() = Some(p.clone());
-    // Widen the scoped fs plugin so the webview can fetch PDF bytes inside
-    // the root (used by the preview pane via convertFileSrc + fetch).
+    // Widen the scoped fs plugin so the webview can fetch PDF bytes anywhere
+    // under the root (used by the preview pane via convertFileSrc + fetch).
+    // Recursive: paper libraries keep PDFs in subfolders.
     use tauri_plugin_fs::FsExt;
     app.fs_scope()
-        .allow_directory(&p, false)
+        .allow_directory(&p, true)
         .map_err(|e| e.to_string())?;
     Ok(())
 }

@@ -73,7 +73,15 @@ export function PdfPane({
       })
       .catch((cause: unknown) => {
         if (!cancelled) {
-          setLoadError(cause instanceof Error ? cause.message : String(cause))
+          // WebKit reports asset-protocol blocks as a bare TypeError
+          // ("Load failed") with no status: name the stage so the next
+          // failure is diagnosable (scope vs. missing file vs. bad PDF).
+          const detail = cause instanceof Error ? cause.message : String(cause)
+          const stage =
+            detail.includes('fetch failed') || detail === 'Load failed'
+              ? 'file fetch (library-root scope or missing file)'
+              : 'PDF parse'
+          setLoadError(`${stage}: ${detail}`)
         }
       })
     return () => {

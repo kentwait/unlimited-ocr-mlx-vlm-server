@@ -145,14 +145,14 @@ class OcrEngine:
     def loaded(self) -> bool:
         return self.model is not None
 
-    def load(self) -> None:
+    def load(self) -> None:  # pragma: no cover - downloads/loads MLX weights
         if self.loaded:
             return
         from mlx_vlm import load
 
         self.model, self.processor = load(self.model_ref)
 
-    def infer_image_file(
+    def infer_image_file(  # pragma: no cover - runs the MLX model
         self,
         image_path: str,
         *,

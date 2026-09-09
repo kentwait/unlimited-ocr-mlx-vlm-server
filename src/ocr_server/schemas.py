@@ -101,6 +101,14 @@ class ReflowRequest(BaseModel):
     text_layer: str | None = Field(default=None, max_length=100_000)
     max_tokens: int = Field(default=6144, ge=16, le=16384)
 
+    @field_validator("markdown")
+    @classmethod
+    def _nonblank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("markdown must not be blank")
+        return v
+
 
 class ReflowResponse(BaseModel):
     contract_version: int = REFLOW_CONTRACT_VERSION

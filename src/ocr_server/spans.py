@@ -65,7 +65,7 @@ def parse_spans(ocr_text: str, page: int = 1) -> list[Span]:
         spans.append(Span(page=page, label="text", box=None, text=_PAGE_RE.sub("", tail).strip()))
     if not spans:
         body = _PAGE_RE.sub("", ocr_text).strip()
-        if body:
+        if body:  # pragma: no cover - unreachable: any non-blank text yields a span above
             spans.append(Span(page=page, label="text", box=None, text=body))
     return spans
 

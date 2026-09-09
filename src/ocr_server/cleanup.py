@@ -217,14 +217,14 @@ class CleanupEngine:
     def loaded(self) -> bool:
         return self.model is not None
 
-    def load(self) -> None:
+    def load(self) -> None:  # pragma: no cover - downloads/loads MLX weights
         if self.loaded:
             return
         from mlx_vlm import load
 
         self.model, self.processor = load(self.model_ref)
 
-    def _generate(self, prompt: str, max_tokens: int) -> tuple[str, int, bool]:
+    def _generate(self, prompt: str, max_tokens: int) -> tuple[str, int, bool]:  # pragma: no cover - runs the MLX model
         """stream_generate + loop-break; returns (text, n_tokens, early_stop)."""
         import time as _time
 

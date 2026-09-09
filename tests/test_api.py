@@ -189,6 +189,111 @@ def test_job_unknown_id(client):
     assert r.status_code == 404
 
 
+def test_parse_pdf_rejects_unreadable_file(client):
+    r = client.post(
+        "/parse/pdf",
+        files={"file": ("t.pdf", b"not a pdf at all", "application/pdf")},
+        data={"pages": "all"},
+    )
+    assert r.status_code == 400
+
+
+def test_parse_pdf_rejects_too_many_pages(client):
+    r = client.post(
+        "/parse/pdf",
+        files={"file": ("t.pdf", _pdf_bytes(55), "application/pdf")},
+        data={"pages": "all"},
+    )
+    assert r.status_code == 400
+    assert "max" in r.json()["detail"]
+
+
+def test_parse_pdf_maps_render_failure(client, monkeypatch):
+    from ocr_server import api as api_mod
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("render exploded")
+
+    monkeypatch.setattr(api_mod, "render_pdf_pages", boom)
+    r = client.post(
+        "/parse/pdf",
+        files={"file": ("t.pdf", _pdf_bytes(1), "application/pdf")},
+        data={"pages": "all"},
+    )
+    assert r.status_code == 400
+    assert "render failed" in r.json()["detail"]
+
+
+def test_job_surfaces_parse_error(client):
+    r = client.post(
+        "/parse/jobs",
+        files={"file": ("t.pdf", _pdf_bytes(2), "application/pdf")},
+        data={"pages": "1-3,9"},
+    )
+    assert r.status_code == 202, r.text
+    job_id = r.json()["job_id"]
+    for _ in range(100):
+        s = client.get(f"/parse/jobs/{job_id}")
+        if s.json()["status"] in ("done", "error"):
+            break
+        time.sleep(0.05)
+    body = s.json()
+    assert body["status"] == "error"
+    assert "out of range" in (body["error"] or "")
+
+
+def test_job_surfaces_unexpected_error(client, monkeypatch):
+    from ocr_server import api as api_mod
+
+    # Raise past the render try/except (which converts to HTTPException) so
+    # the job's generic-Exception handler is the one that records the error.
+    def boom(*args, **kwargs):
+        raise RuntimeError("furniture exploded")
+
+    monkeypatch.setattr(api_mod, "apply_furniture", boom)
+    r = client.post(
+        "/parse/jobs",
+        files={"file": ("t.pdf", _pdf_bytes(1), "application/pdf")},
+        data={"pages": "all"},
+    )
+    job_id = r.json()["job_id"]
+    for _ in range(100):
+        s = client.get(f"/parse/jobs/{job_id}")
+        if s.json()["status"] in ("done", "error"):
+            break
+        time.sleep(0.05)
+    body = s.json()
+    assert body["status"] == "error"
+    assert "furniture exploded" in (body["error"] or "")
+
+
+def test_image_http_error_passes_through(client, monkeypatch):
+    from fastapi import HTTPException
+
+    from ocr_server.fake import FakeEngine
+
+    def fail(*args, **kwargs):
+        raise HTTPException(status_code=400, detail="bad image")
+
+    monkeypatch.setattr(FakeEngine, "infer_image_file", fail)
+    r = client.post(
+        "/parse/image",
+        files={"file": ("t.png", _png_bytes(), "image/png")},
+    )
+    assert r.status_code == 400
+    assert r.json()["detail"] == "bad image"
+
+
+def test_cleanup_engine_disabled_env(monkeypatch):
+    from ocr_server import api as api_mod
+
+    monkeypatch.setattr(api_mod.holder, "is_fake", False)
+    monkeypatch.setenv("OCR_CLEANUP", "0")
+    monkeypatch.setattr(api_mod, "_cleanup_engine", None)
+    assert api_mod._get_cleanup_engine() is None
+    monkeypatch.setattr(api_mod, "_cleanup_engine", None)
+
+
 # ---------- furniture (generic-only; journal templates live in Paperhub) ----------
 
 

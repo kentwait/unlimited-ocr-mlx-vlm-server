@@ -26,6 +26,9 @@ dev = [
     "pytest>=8.0.0",
     "httpx>=0.27.0",
     "huggingface-hub[hf_xet]>=0.30.0",
+    "pytest-cov>=7.1.0",
+    "hypothesis>=6.168.0",
+    "mutmut>=3.7.0",
 ]
 
 [build-system]
@@ -40,3 +43,13 @@ ocr-server = "ocr_server.__main__:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["src/ocr_server"]
+branch = false
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+# fail_under is enforced by CI/Makefile, not here, so local runs stay fast:
+# make coverage  (fail_under=95; ratchet up, never down)

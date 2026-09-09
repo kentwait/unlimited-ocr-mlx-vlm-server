@@ -26,7 +26,7 @@ from .furniture import apply_furniture
 from .pages import parse_pages_spec
 from .pdfrender import render_pdf_pages
 from .prompts import PROMPTS_DIR as PROMPTS_DIR_DEFAULT, PromptRegistry
-from .spans import parse_spans, render_markdown, spans_to_jsonl
+from .spans import JOURNALS, parse_spans, render_markdown, spans_to_jsonl
 from .schemas import (
     REFLOW_CONTRACT_VERSION,
     DocumentParseResponse,
@@ -225,17 +225,25 @@ async def _infer_image_path(
 
 
 def _run_cleanup_sync(
-    cleanup: "CleanupEngine", ocr_text: str, text_layer: str | None, page: int
+    cleanup: "CleanupEngine",
+    ocr_text: str,
+    text_layer: str | None,
+    page: int,
+    journal: str = "generic",
 ):
-    return cleanup.cleanup_page(ocr_text, text_layer, page=page)
+    return cleanup.cleanup_page(ocr_text, text_layer, page=page, journal=journal)
 
 
 async def _run_cleanup(
-    cleanup: "CleanupEngine", ocr_text: str, text_layer: str | None, page: int = 1
+    cleanup: "CleanupEngine",
+    ocr_text: str,
+    text_layer: str | None,
+    page: int = 1,
+    journal: str = "generic",
 ):
     async with infer_limiter:
         return await anyio.to_thread.run_sync(
-            _run_cleanup_sync, cleanup, ocr_text, text_layer, page
+            _run_cleanup_sync, cleanup, ocr_text, text_layer, page, journal
         )
 
 
@@ -272,6 +280,17 @@ def _furniture_from_form(furniture: str) -> str:
     return furniture
 
 
+def _journal_from_form(journal: str) -> str:
+    """Eager `journal` field validation: fail fast with 400, including
+    before a background job is created (job errors are poll-only)."""
+    if journal not in JOURNALS:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"unknown journal {journal!r}: expected one of {', '.join(JOURNALS)}",
+        )
+    return journal
+
+
 async def _parse_pdf_path(
     path: Path,
     *,
@@ -280,6 +299,7 @@ async def _parse_pdf_path(
     params: InferenceParams,
     ocr_model: str | None = None,
     furniture: str = "auto",
+    journal: str = "generic",
     job: JobStatus | None = None,
 ) -> DocumentParseResponse:
     """Open, render, and OCR a PDF file. Caller owns cleanup of `path`.
@@ -349,7 +369,7 @@ async def _parse_pdf_path(
             },
             "samples": finfo["samples"],
         }
-        page_markdowns = [render_markdown(spans) for spans in all_spans]
+        page_markdowns = [render_markdown(spans, journal) for spans in all_spans]
 
         results: list[PageResult] = []
         for (page_num, img_path, text, stats, elapsed), spans, md in zip(
@@ -370,7 +390,9 @@ async def _parse_pdf_path(
                 text_layer = doc[page_num - 1].get_text()
                 if job is not None:
                     job.phase = "cleanup"
-                cleaned, cstats = await _run_cleanup(cleanup, text, text_layer, page=page_num)
+                cleaned, cstats = await _run_cleanup(
+                    cleanup, text, text_layer, page=page_num, journal=journal
+                )
                 page_res.markdown = cleaned
                 page_res.cleanup_method = cstats.method
                 page_res.cleanup_elapsed_s = round(cstats.elapsed_s, 3)
@@ -412,6 +434,7 @@ async def _parse_pdf_path(
         results=results,
         total_elapsed_s=round(total_elapsed, 3),
         furniture=doc_furniture,
+        journal=journal,
     )
     # Response summary: aggregate correction stats across pages.
     tot_edits = sum(
@@ -461,9 +484,11 @@ async def parse_image(
     image_size: int = Form(640),
     cropping: bool = Form(True),
     ocr_model: str = Form("default"),
+    journal: str = Form("generic"),
 ) -> DocumentParseResponse:
     """Parse one image (JPEG/PNG/WebP) to markdown/text (gundam mode default)."""
     params = _params_from_form(prompt, max_tokens, temperature, base_size, image_size, cropping)
+    journal = _journal_from_form(journal)
     suffix = Path(file.filename or "x.jpg").suffix.lower() or ".png"
     path = await _save_upload(file, suffix)
     try:
@@ -485,7 +510,7 @@ async def parse_image(
     corrections = None
     spans_jsonl = None
     if cleanup is not None:
-        cleaned, cstats = await _run_cleanup(cleanup, text, None)
+        cleaned, cstats = await _run_cleanup(cleanup, text, None, journal=journal)
         text = cleaned
         cleanup_method = cstats.method
         cleanup_elapsed = round(cstats.elapsed_s, 3)
@@ -535,6 +560,7 @@ async def parse_image(
             )
         ],
         total_elapsed_s=round(elapsed, 3),
+        journal=journal,
     )
 
 
@@ -555,6 +581,7 @@ async def parse_pdf(
     cropping: bool = Form(True),
     ocr_model: str = Form("default"),
     furniture: str = Form("auto"),
+    journal: str = Form("generic"),
 ) -> DocumentParseResponse:
     """Parse a PDF to markdown. `pages` = "all" | "1-3,5". One OCR call per page.
 
@@ -563,10 +590,12 @@ async def parse_pdf(
     """
     params = _params_from_form(prompt, max_tokens, temperature, base_size, image_size, cropping)
     furniture = _furniture_from_form(furniture)
+    journal = _journal_from_form(journal)
     path = await _save_upload(file, ".pdf")
     try:
         return await _parse_pdf_path(
-            path, pages=pages, dpi=dpi, params=params, ocr_model=ocr_model, furniture=furniture
+            path, pages=pages, dpi=dpi, params=params, ocr_model=ocr_model,
+            furniture=furniture, journal=journal,
         )
     finally:
         path.unlink(missing_ok=True)
@@ -585,10 +614,12 @@ async def parse_pdf_async(
     cropping: bool = Form(True),
     ocr_model: str = Form("default"),
     furniture: str = Form("auto"),
+    journal: str = Form("generic"),
 ) -> JobStatus:
     """Submit a PDF parse as a background job (returns immediately with job_id)."""
     params = _params_from_form(prompt, max_tokens, temperature, base_size, image_size, cropping)
     furniture = _furniture_from_form(furniture)
+    journal = _journal_from_form(journal)
     path = await _save_upload(file, ".pdf")
     job_id = uuid.uuid4().hex[:12]
     job = JobStatus(
@@ -606,7 +637,7 @@ async def parse_pdf_async(
         try:
             resp = await _parse_pdf_path(
                 path, pages=pages, dpi=dpi, params=params, ocr_model=ocr_model,
-                furniture=furniture, job=job,
+                furniture=furniture, journal=journal, job=job,
             )
             job.status = "done"
             job.result = resp

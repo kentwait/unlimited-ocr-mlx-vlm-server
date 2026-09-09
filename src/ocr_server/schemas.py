@@ -57,6 +57,7 @@ class DocumentParseResponse(BaseModel):
     results: list[PageResult]
     total_elapsed_s: float
     furniture: dict | None = None  # {template, removed_total, removed_by_page, samples}
+    journal: str = "generic"  # render policy applied; echoes the request journal
 
 
 class HealthResponse(BaseModel):

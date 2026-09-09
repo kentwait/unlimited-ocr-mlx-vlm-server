@@ -90,6 +90,31 @@ def test_render_markdown_skips_page_duplicates():
     assert render_markdown([page]) == "whole page"
 
 
+def test_render_markdown_drops_structural_labels_per_journal():
+    from ocr_server.spans import JOURNALS, drop_labels_for
+
+    assert set(JOURNALS) == {"generic", "nature", "science", "pmc"}
+    header = Span(page=1, label="header", box=None, text="SPECIAL SECTION")
+    footer = Span(page=1, label="footer", box=None, text="journal boilerplate")
+    pagenum = Span(page=1, label="page_number", box=None, text="12")
+    aside = Span(page=1, label="aside_text", box=None, text="Downloaded from x")
+    affil = Span(page=1, label="page_footnote", box=None, text="Dept of X")
+    body = Span(page=1, label="text", box=None, text="real content here")
+    for journal in JOURNALS:
+        assert drop_labels_for(journal) >= {
+            "header",
+            "footer",
+            "page_number",
+            "aside_text",
+            "page_footnote",
+        }
+        assert render_markdown([header, footer, pagenum, aside, affil, body], journal) == (
+            "real content here"
+        )
+    # Unknown journals fall back to the universal set, never to nothing.
+    assert "header" in drop_labels_for("cell")
+
+
 def test_strip_helpers():
     raw = "<|det|>text [0,0,1,1]<|/det|>hi [1, 2]"
     assert "det" not in spans_strip(raw)

@@ -263,15 +263,17 @@ class CleanupEngine:
         text_layer: str | None,
         max_tokens: int = 6144,
         page: int = 1,
+        journal: str = "generic",
     ) -> tuple[str, CleanupStats]:
         """Check/clean one page. Returns (markdown, stats); stats.spans_jsonl
-        carries the structured span intermediate (see ocr_server.spans)."""
+        carries the structured span intermediate (see ocr_server.spans).
+        The checker input already excludes the journal's structural spans."""
         import time as _time
 
         t0 = _time.perf_counter()
         spans = parse_spans(ocr_text, page=page)
         spans_jsonl = spans_to_jsonl(spans)
-        pre = render_markdown(spans)
+        pre = render_markdown(spans, journal)
 
         has_text_layer = bool(text_layer) and len(text_layer.strip()) >= 200
         if has_text_layer:

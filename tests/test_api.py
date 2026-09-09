@@ -189,6 +189,41 @@ def test_job_unknown_id(client):
     assert r.status_code == 404
 
 
+def test_parse_pdf_rejects_unknown_journal(client):
+    r = client.post(
+        "/parse/pdf",
+        files={"file": ("t.pdf", _pdf_bytes(1), "application/pdf")},
+        data={"pages": "all", "journal": "cell"},
+    )
+    assert r.status_code == 400
+    assert "journal" in r.json()["detail"]
+
+
+def test_parse_jobs_rejects_unknown_journal_before_creating(client):
+    r = client.post(
+        "/parse/jobs",
+        files={"file": ("t.pdf", _pdf_bytes(1), "application/pdf")},
+        data={"pages": "all", "journal": "cell"},
+    )
+    assert r.status_code == 400
+
+
+def test_response_echoes_request_journal(client):
+    r = client.post(
+        "/parse/pdf",
+        files={"file": ("t.pdf", _pdf_bytes(1), "application/pdf")},
+        data={"pages": "all", "journal": "nature"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["journal"] == "nature"
+    r = client.post(
+        "/parse/pdf",
+        files={"file": ("t.pdf", _pdf_bytes(1), "application/pdf")},
+        data={"pages": "all"},
+    )
+    assert r.json()["journal"] == "generic"
+
+
 def test_parse_pdf_rejects_unreadable_file(client):
     r = client.post(
         "/parse/pdf",

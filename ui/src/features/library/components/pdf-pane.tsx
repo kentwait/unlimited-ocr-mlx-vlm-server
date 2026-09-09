@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { ReactNode } from 'react'
 import * as pdfjs from 'pdfjs-dist'
 import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 import { AlertTriangle, ChevronLeft, ChevronRight, Loader2 } from 'lucide-react'
@@ -29,6 +30,8 @@ type PdfPaneProps = {
   scrollToken: number
   spansByPage: Map<number, Span[]> | null
   syncEnabled: boolean
+  /** OCR controls slotted left of the pager (owned by the parent). */
+  headerLeft?: ReactNode
   /** Overlay -> markdown: clicking a span box jumps to its section. */
   onSpanClick: ((span: Span) => void) | undefined
 }
@@ -187,6 +190,7 @@ export function PdfPane({
   scrollToken,
   spansByPage,
   syncEnabled,
+  headerLeft,
   onSpanClick,
 }: PdfPaneProps): React.JSX.Element {
   const wrapRef = useRef<HTMLDivElement | null>(null)
@@ -363,6 +367,7 @@ export function PdfPane({
   return (
     <div className="flex h-full flex-col" data-testid="pdf-pane">
       <div className="flex h-12 shrink-0 items-center gap-2 border-b border-border px-3">
+        {headerLeft}
         <div className="ml-auto flex items-center gap-2">
           <Button
             variant="ghost"

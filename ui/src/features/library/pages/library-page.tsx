@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { FolderOpen, RefreshCw } from 'lucide-react'
+import { FolderOpen, Moon, RefreshCw, Sun, X } from 'lucide-react'
 
 import { Button } from '#/shared/components/ui/button'
 import { cn } from '#/lib/cn'
@@ -78,7 +78,7 @@ export function LibraryPage(): React.JSX.Element {
   const [selected, setSelected] = useState<TreeNode | null>(null)
   const [markdown, setMarkdown] = useState<string | null>(null)
   const [spans, setSpans] = useState<Map<number, Span[]> | null>(null)
-  const [syncEnabled, setSyncEnabled] = useState(true)
+  // Sync is always on now (checkbox removed): panes get a constant true.
   const [health, setHealth] = useState<'checking' | 'ok' | 'down'>('checking')
   const [job, setJob] = useState<JobState | null>(null)
   const [jobError, setJobError] = useState<string | null>(null)
@@ -102,6 +102,28 @@ export function LibraryPage(): React.JSX.Element {
     ocrModel: 'default',
   })
   const [showOptions, setShowOptions] = useState(false)
+  /** Theme override (class on <html>); falls back to the OS preference. */
+  const [theme, setTheme] = useState<'light' | 'dark'>(() => {
+    try {
+      if (typeof window === 'undefined') return 'light'
+      const saved = window.localStorage.getItem('ocr-ui:theme')
+      if (saved === 'light' || saved === 'dark') return saved
+      return window.matchMedia('(prefers-color-scheme: dark)').matches
+        ? 'dark'
+        : 'light'
+    } catch {
+      return 'light'
+    }
+  })
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', theme === 'dark')
+    document.documentElement.style.colorScheme = theme
+    try {
+      window.localStorage.setItem('ocr-ui:theme', theme)
+    } catch {
+      // persistence is best-effort
+    }
+  }, [theme])
   const loadedForPath = useRef<string | null>(null)
   const panesRef = useRef<HTMLDivElement | null>(null)
   // Mirror for the markdown-visible-page callback (avoids stale closures).
@@ -189,6 +211,21 @@ export function LibraryPage(): React.JSX.Element {
     const chosen = await pickRootFolder()
     if (chosen !== null) await loadTree(chosen)
   }, [loadTree])
+
+  /** Close the root folder and return to the initial (no-folder) state. */
+  function closeRoot(): void {
+    setRootState(null)
+    setTreeState(null)
+    setSelected(null)
+    setMarkdown(null)
+    setSpans(null)
+    setSpansWarning(null)
+    setJobError(null)
+    setTreeError(null)
+    setCurrentPage(1)
+    setFocusSpan(null)
+    setShowOptions(false)
+  }
 
   // Selection -> load markdown + spans sidecars (once per path).
   const selectNode = useCallback((node: TreeNode) => {
@@ -295,6 +332,118 @@ export function LibraryPage(): React.JSX.Element {
       ? `${String(job.status.pages_done ?? 0)}/${String(job.status.pages_total)}`
       : null
 
+  // OCR controls live in the PDF pane header (left of the pager); the
+  // toolbar keeps only navigation + server status.
+  const ocrControls =
+    selected?.kind === 'pdf' ? (
+      <>
+        {job === null ? (
+          <div className="relative inline-flex items-center gap-1">
+            <Button size="sm" onClick={() => void startOcr(selected)}>
+              {selected.hasMd ? 'Re-run OCR' : 'OCR this PDF'}
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              aria-label="OCR options"
+              aria-expanded={showOptions}
+              onClick={() => setShowOptions((v) => !v)}
+            >
+              ⚙
+            </Button>
+            {showOptions ? (
+              <div className="absolute left-0 top-full z-10 mt-1 w-56 rounded-lg border border-border bg-card p-3 shadow-lg">
+                <label className="mb-2 block text-xs text-muted-foreground">
+                  pages
+                  <input
+                    type="text"
+                    value={ocrOptions.pages}
+                    onChange={(event) =>
+                      setOcrOptions((o) => ({
+                        ...o,
+                        pages: event.target.value || 'all',
+                      }))
+                    }
+                    placeholder="all | 1-3,5"
+                    className="mt-1 w-full rounded-md border border-input bg-background px-2 py-1 text-xs text-foreground"
+                  />
+                </label>
+                <label className="mb-2 block text-xs text-muted-foreground">
+                  dpi
+                  <select
+                    value={ocrOptions.dpi}
+                    onChange={(event) =>
+                      setOcrOptions((o) => ({
+                        ...o,
+                        dpi: Number(event.target.value),
+                      }))
+                    }
+                    className="mt-1 w-full rounded-md border border-input bg-background px-2 py-1 text-xs text-foreground"
+                  >
+                    <option value={150}>150</option>
+                    <option value={200}>200</option>
+                    <option value={300}>300</option>
+                  </select>
+                </label>
+                <label className="mb-2 block text-xs text-muted-foreground">
+                  ocr model
+                  <select
+                    value={ocrOptions.ocrModel}
+                    onChange={(event) =>
+                      setOcrOptions((o) => ({
+                        ...o,
+                        ocrModel: event.target
+                          .value as ParseOptions['ocrModel'],
+                      }))
+                    }
+                    className="mt-1 w-full rounded-md border border-input bg-background px-2 py-1 text-xs text-foreground"
+                  >
+                    <option value="default">default (mxfp8)</option>
+                    <option value="bf16">bf16 (loop-free dense)</option>
+                  </select>
+                </label>
+                <label className="block text-xs text-muted-foreground">
+                  furniture
+                  <select
+                    value={ocrOptions.furniture}
+                    onChange={(event) =>
+                      setOcrOptions((o) => ({
+                        ...o,
+                        furniture: event.target
+                          .value as ParseOptions['furniture'],
+                      }))
+                    }
+                    className="mt-1 w-full rounded-md border border-input bg-background px-2 py-1 text-xs text-foreground"
+                  >
+                    <option value="auto">auto</option>
+                    <option value="none">none</option>
+                    <option value="nature">nature</option>
+                    <option value="science">science</option>
+                    <option value="pmc">pmc</option>
+                  </select>
+                </label>
+              </div>
+            ) : null}
+          </div>
+        ) : (
+          <span className="inline-flex items-center gap-2 text-xs text-primary">
+            OCR{' '}
+            {progress === null
+              ? job.status.status
+              : `${progress} · ${job.status.phase ?? 'ocr'}`}
+          </span>
+        )}
+        {jobError !== null ? (
+          <span
+            role="alert"
+            className="max-w-72 truncate text-xs text-destructive"
+          >
+            {jobError}
+          </span>
+        ) : null}
+      </>
+    ) : null
+
   return (
     // Fixed-position root: the document itself can never scroll, so pane
     // follow-scrolls can't yank the top chrome out of view.
@@ -307,6 +456,16 @@ export function LibraryPage(): React.JSX.Element {
         <Button
           variant="ghost"
           size="icon"
+          aria-label="Close folder"
+          title="Close folder"
+          disabled={root === null}
+          onClick={() => closeRoot()}
+        >
+          <X className="size-4" aria-hidden />
+        </Button>
+        <Button
+          variant="ghost"
+          size="icon"
           aria-label="Refresh tree"
           onClick={() => void refreshTree()}
         >
@@ -315,131 +474,12 @@ export function LibraryPage(): React.JSX.Element {
         <span className="ml-2 min-w-0 flex-1 truncate text-xs text-muted-foreground">
           {root ?? 'no folder open'}
         </span>
-        {selected?.kind === 'pdf' ? (
-          job === null ? (
-            <div className="relative inline-flex items-center gap-1">
-              <Button size="sm" onClick={() => void startOcr(selected)}>
-                {selected.hasMd ? 'Re-run OCR' : 'OCR this PDF'}
-              </Button>
-              <Button
-                variant="ghost"
-                size="sm"
-                aria-label="OCR options"
-                aria-expanded={showOptions}
-                onClick={() => setShowOptions((v) => !v)}
-              >
-                ⚙
-              </Button>
-              {showOptions ? (
-                <div className="absolute right-0 top-full z-10 mt-1 w-56 rounded-lg border border-border bg-card p-3 shadow-lg">
-                  <label className="mb-2 block text-xs text-muted-foreground">
-                    pages
-                    <input
-                      type="text"
-                      value={ocrOptions.pages}
-                      onChange={(event) =>
-                        setOcrOptions((o) => ({
-                          ...o,
-                          pages: event.target.value || 'all',
-                        }))
-                      }
-                      placeholder="all | 1-3,5"
-                      className="mt-1 w-full rounded-md border border-input bg-background px-2 py-1 text-xs text-foreground"
-                    />
-                  </label>
-                  <label className="mb-2 block text-xs text-muted-foreground">
-                    dpi
-                    <select
-                      value={ocrOptions.dpi}
-                      onChange={(event) =>
-                        setOcrOptions((o) => ({
-                          ...o,
-                          dpi: Number(event.target.value),
-                        }))
-                      }
-                      className="mt-1 w-full rounded-md border border-input bg-background px-2 py-1 text-xs text-foreground"
-                    >
-                      <option value={150}>150</option>
-                      <option value={200}>200</option>
-                      <option value={300}>300</option>
-                    </select>
-                  </label>
-                  <label className="mb-2 block text-xs text-muted-foreground">
-                    ocr model
-                    <select
-                      value={ocrOptions.ocrModel}
-                      onChange={(event) =>
-                        setOcrOptions((o) => ({
-                          ...o,
-                          ocrModel: event.target
-                            .value as ParseOptions['ocrModel'],
-                        }))
-                      }
-                      className="mt-1 w-full rounded-md border border-input bg-background px-2 py-1 text-xs text-foreground"
-                    >
-                      <option value="default">default (mxfp8)</option>
-                      <option value="bf16">bf16 (loop-free dense)</option>
-                    </select>
-                  </label>
-                  <label className="block text-xs text-muted-foreground">
-                    furniture
-                    <select
-                      value={ocrOptions.furniture}
-                      onChange={(event) =>
-                        setOcrOptions((o) => ({
-                          ...o,
-                          furniture: event.target
-                            .value as ParseOptions['furniture'],
-                        }))
-                      }
-                      className="mt-1 w-full rounded-md border border-input bg-background px-2 py-1 text-xs text-foreground"
-                    >
-                      <option value="auto">auto</option>
-                      <option value="none">none</option>
-                      <option value="nature">nature</option>
-                      <option value="science">science</option>
-                      <option value="pmc">pmc</option>
-                    </select>
-                  </label>
-                </div>
-              ) : null}
-            </div>
-          ) : (
-            <span className="inline-flex items-center gap-2 text-xs text-primary">
-              OCR{' '}
-              {progress === null
-                ? job.status.status
-                : `${progress} · ${job.status.phase ?? 'ocr'}`}
-            </span>
-          )
-        ) : (
-          <span className="text-xs text-muted-foreground">
-            select a PDF to OCR
-          </span>
-        )}
-        {jobError !== null ? (
-          <span
-            role="alert"
-            className="max-w-72 truncate text-xs text-destructive"
-          >
-            {jobError}
-          </span>
-        ) : null}
-        <label className="ml-2 inline-flex cursor-pointer items-center gap-1.5 text-xs text-muted-foreground">
-          <input
-            type="checkbox"
-            checked={syncEnabled}
-            onChange={(event) => setSyncEnabled(event.target.checked)}
-          />
-          sync
-        </label>
         <span
           role="status"
           aria-label={`OCR server ${getOcrBaseUrl()} ${health === 'ok' ? 'reachable' : 'unreachable'}`}
           title={getOcrBaseUrl()}
           className="ml-2 inline-flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground"
         >
-          server {getOcrBaseUrl()} ·{' '}
           {health === 'ok' ? (
             <span className="font-medium text-primary">connected</span>
           ) : health === 'checking' ? (
@@ -475,17 +515,7 @@ export function LibraryPage(): React.JSX.Element {
           ) : null}
           {tree === null ? (
             <div className="p-3">
-              <p className="mb-3 text-sm text-muted-foreground">
-                No folder open.
-              </p>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => void openRoot()}
-              >
-                <FolderOpen className="size-4" aria-hidden />
-                Open root…
-              </Button>
+              <p className="text-sm text-muted-foreground">No folder open.</p>
             </div>
           ) : (
             <LibraryTree
@@ -527,8 +557,9 @@ export function LibraryPage(): React.JSX.Element {
               onJumpPage={goPdfPage}
               scrollToken={pdfToken}
               spansByPage={spans}
-              syncEnabled={syncEnabled}
+              syncEnabled
               onSpanClick={handleSpanClick}
+              headerLeft={ocrControls}
             />
           ) : (
             <div className="flex flex-1 items-center justify-center p-6 text-sm text-muted-foreground">
@@ -561,7 +592,7 @@ export function LibraryPage(): React.JSX.Element {
           <MarkdownPane
             markdown={markdown}
             currentPage={currentPage}
-            syncEnabled={syncEnabled}
+            syncEnabled
             onChunkClick={goPdfPage}
             scrollToken={scrollToken}
             focusSpan={focusSpan}
@@ -584,6 +615,22 @@ export function LibraryPage(): React.JSX.Element {
         data-testid="status-bar"
         className="flex shrink-0 items-center gap-3 border-t border-border px-3 py-1.5 text-xs text-muted-foreground"
       >
+        <Button
+          variant="ghost"
+          size="icon"
+          className="size-6 shrink-0"
+          aria-label={
+            theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'
+          }
+          title="Toggle light / dark theme"
+          onClick={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
+        >
+          {theme === 'dark' ? (
+            <Sun className="size-3.5" aria-hidden />
+          ) : (
+            <Moon className="size-3.5" aria-hidden />
+          )}
+        </Button>
         <span className="min-w-0 flex-1 truncate">
           {selected?.kind === 'pdf'
             ? `${selected.name} · page ${String(currentPage)}`

@@ -1,0 +1,89 @@
+@import 'tailwindcss';
+
+@theme inline {
+  --font-sans: 'Avenir Next', 'Segoe UI', sans-serif;
+  --font-display: 'Iowan Old Style', 'Palatino Linotype', serif;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+}
+
+:root {
+  color-scheme: light;
+  --background: oklch(0.968 0.012 79);
+  --foreground: oklch(0.225 0.024 62);
+  --card: oklch(0.992 0.006 82);
+  --card-foreground: oklch(0.225 0.024 62);
+  --primary: oklch(0.49 0.102 166);
+  --primary-foreground: oklch(0.985 0.009 82);
+  --muted: oklch(0.92 0.018 78);
+  --muted-foreground: oklch(0.47 0.03 66);
+  --border: oklch(0.84 0.026 75);
+  --input: oklch(0.78 0.03 75);
+  --ring: oklch(0.58 0.111 166);
+  --destructive: oklch(0.53 0.19 28);
+  --destructive-foreground: oklch(0.985 0.009 82);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --background: oklch(0.19 0.018 62);
+    --foreground: oklch(0.92 0.016 82);
+    --card: oklch(0.23 0.021 62);
+    --card-foreground: oklch(0.92 0.016 82);
+    --primary: oklch(0.72 0.105 166);
+    --primary-foreground: oklch(0.17 0.026 165);
+    --muted: oklch(0.28 0.025 64);
+    --muted-foreground: oklch(0.71 0.025 75);
+    --border: oklch(0.35 0.027 64);
+    --input: oklch(0.42 0.03 64);
+    --ring: oklch(0.72 0.105 166);
+    --destructive: oklch(0.66 0.19 28);
+    --destructive-foreground: oklch(0.98 0.012 82);
+  }
+}
+
+@layer base {
+  * {
+    border-color: var(--border);
+  }
+
+  html {
+    min-width: 320px;
+    background: var(--background);
+  }
+
+  body {
+    min-height: 100vh;
+    margin: 0;
+    background:
+      radial-gradient(
+        circle at 15% 8%,
+        color-mix(in oklch, var(--primary) 13%, transparent),
+        transparent 28rem
+      ),
+      linear-gradient(
+        135deg,
+        color-mix(in oklch, var(--background) 92%, var(--card)),
+        var(--background)
+      );
+    color: var(--foreground);
+    font-family: var(--font-sans);
+    text-rendering: optimizeLegibility;
+  }
+
+  ::selection {
+    background: color-mix(in oklch, var(--primary) 35%, transparent);
+  }
+}

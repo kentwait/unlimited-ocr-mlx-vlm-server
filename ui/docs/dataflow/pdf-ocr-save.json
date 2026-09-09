@@ -1,0 +1,178 @@
+{
+  "version": 3,
+  "directed": true,
+  "multigraph": true,
+  "graph": {
+    "name": "PDF OCR Job & Sidecar Save"
+  },
+  "nodes": [
+    {
+      "id": "LIBRARY_UI",
+      "symbol": "LibraryPage.startOcr",
+      "group": 1,
+      "role": "initiator",
+      "description": "User clicks OCR on a PDF; startOcr reads bytes, submits the job, polls, saves sidecars.",
+      "evidence": "code"
+    },
+    {
+      "id": "FS_ROOT",
+      "symbol": "-",
+      "group": 8,
+      "role": "sink",
+      "description": "PDF read for upload; markdown + spans JSONL written next to it.",
+      "evidence": "code"
+    },
+    {
+      "id": "OCR_SERVER",
+      "symbol": "parse_pdf_async",
+      "group": 7,
+      "role": "intermediary",
+      "description": "FastAPI POST /parse/jobs; background task runs render/OCR/furniture/cleanup, writes per-stage progress onto the job.",
+      "evidence": "code"
+    },
+    {
+      "id": "OCR_JOB_POLL",
+      "symbol": "get_job",
+      "group": 7,
+      "role": "intermediary",
+      "description": "FastAPI GET /parse/jobs/{id}; returns status + phase/pages_done/pages_total; 404 when unknown id.",
+      "evidence": "code"
+    },
+    {
+      "id": "RUST_WRITE_CMD",
+      "symbol": "write_text_file",
+      "group": 2,
+      "role": "intermediary",
+      "description": "Rust command writing UTF-8 files inside the root (sidecar save).",
+      "evidence": "code"
+    }
+  ],
+  "links": [
+    {
+      "seq": 1,
+      "source": "LIBRARY_UI",
+      "target": "FS_ROOT",
+      "kind": "call",
+      "outcome": "success",
+      "phase": "submit",
+      "description": "fetch(convertFileSrc(pdf)) -> File for multipart upload"
+    },
+    {
+      "seq": 2,
+      "source": "LIBRARY_UI",
+      "target": "OCR_SERVER",
+      "kind": "call",
+      "outcome": "success",
+      "phase": "submit",
+      "description": "POST /parse/jobs (multipart: file, pages=all, dpi=300, furniture=auto, ocr_model=default)"
+    },
+    {
+      "seq": 3,
+      "source": "OCR_SERVER",
+      "target": "OCR_JOB_POLL",
+      "kind": "event",
+      "outcome": "success",
+      "phase": "run",
+      "description": "asyncio.create_task(_run): job status pending->running; phase/pages progress updates"
+    },
+    {
+      "seq": 4,
+      "source": "OCR_SERVER",
+      "target": "LIBRARY_UI",
+      "kind": "return",
+      "outcome": "success",
+      "phase": "submit",
+      "description": "202 ParseJobStatus (job_id)"
+    },
+    {
+      "seq": 5,
+      "source": "LIBRARY_UI",
+      "target": "OCR_JOB_POLL",
+      "kind": "call",
+      "outcome": "success",
+      "phase": "poll",
+      "description": "pollJobUntilDone loop (1.5s interval), ParseJobStatusSchema-validated"
+    },
+    {
+      "seq": 6,
+      "source": "OCR_JOB_POLL",
+      "target": "LIBRARY_UI",
+      "kind": "return",
+      "outcome": "success",
+      "phase": "poll",
+      "description": "status done|error, or running with progress"
+    },
+    {
+      "seq": 7,
+      "source": "LIBRARY_UI",
+      "target": "RUST_WRITE_CMD",
+      "kind": "call",
+      "outcome": "success",
+      "phase": "save",
+      "description": "writeTextFile(<stem>.md, assembleMarkdown(results)) with ocr:page anchors"
+    },
+    {
+      "seq": 8,
+      "source": "RUST_WRITE_CMD",
+      "target": "FS_ROOT",
+      "kind": "call",
+      "outcome": "success",
+      "phase": "save",
+      "description": "fs write inside root"
+    },
+    {
+      "seq": 9,
+      "source": "LIBRARY_UI",
+      "target": "RUST_WRITE_CMD",
+      "kind": "call",
+      "outcome": "success",
+      "phase": "save",
+      "description": "writeTextFile(<stem>.spans.jsonl, per-page spans_jsonl join)"
+    },
+    {
+      "seq": 10,
+      "source": "RUST_WRITE_CMD",
+      "target": "FS_ROOT",
+      "kind": "call",
+      "outcome": "success",
+      "phase": "save",
+      "description": "fs write inside root"
+    },
+    {
+      "seq": 11,
+      "source": "RUST_WRITE_CMD",
+      "target": "LIBRARY_UI",
+      "kind": "return",
+      "outcome": "success",
+      "phase": "save",
+      "description": "both writes ok -> refreshTree() (badges appear), setMarkdown"
+    },
+    {
+      "seq": 12,
+      "source": "OCR_SERVER",
+      "target": "LIBRARY_UI",
+      "kind": "return",
+      "outcome": "error",
+      "phase": "poll",
+      "description": "job error: HTTPException detail becomes job.error; UI shows alert, no sidecars written"
+    },
+    {
+      "seq": 13,
+      "source": "OCR_SERVER",
+      "target": "OCR_JOB_POLL",
+      "kind": "return",
+      "outcome": "error",
+      "phase": "poll",
+      "description": "unknown job id -> 404; poll loop surfaces 'OCR server 404'"
+    },
+    {
+      "seq": 14,
+      "source": "OCR_SERVER",
+      "target": "LIBRARY_UI",
+      "kind": "return",
+      "outcome": "anomaly",
+      "phase": "run",
+      "description": "server restart during a running job loses the job: poll then 404s (in-memory _jobs)"
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "metadataGeneration": {
+    "branchName": {
+      "instructions": "Prefix branches with `feat/` for new features, `fix/` for focused fixes, `refactor/` for larger refactoring changes, `specs/` for new planning and specification documentation, and `docs/` for other documentation."
+    }
+  }
+}

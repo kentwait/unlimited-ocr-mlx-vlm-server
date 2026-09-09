@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
 
 import {
@@ -75,6 +75,24 @@ export function markdownPathFor(pdfPath: string): string {
 
 export function spansPathFor(pdfPath: string): string {
   return `${pdfPath.replace(/\.pdf$/i, '')}.spans.jsonl`
+}
+
+/**
+ * Reads a PDF's bytes for preview/upload. Inside Tauri this goes through the
+ * fs plugin (same root scope as the asset protocol, but a transport that
+ * actually delivers bytes to fetch-hostile WebKit paths); outside Tauri it
+ * falls back to fetch, which degrades to the usual load error.
+ */
+export async function readPdfBytes(path: string): Promise<Uint8Array> {
+  if (isTauriRuntime()) {
+    const { readFile } = await import('@tauri-apps/plugin-fs')
+    return readFile(path)
+  }
+  const response = await fetch(convertFileSrc(path))
+  if (!response.ok) {
+    throw new Error(`fetch failed (${String(response.status)})`)
+  }
+  return new Uint8Array(await response.arrayBuffer())
 }
 
 export type FsDebug = {

@@ -1,11 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import * as pdfjs from 'pdfjs-dist'
 import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
-import { convertFileSrc } from '@tauri-apps/api/core'
 import { AlertTriangle, ChevronLeft, ChevronRight, Loader2 } from 'lucide-react'
 
 import { Button } from '#/shared/components/ui/button'
-import { debugFs } from '../library.functions'
+import { debugFs, readPdfBytes } from '../library.functions'
 import type { Span, TreeNode } from '../library.schema'
 
 pdfjs.GlobalWorkerOptions.workerSrc = workerUrl
@@ -46,22 +45,16 @@ export function PdfPane({
   const [canvasSize, setCanvasSize] = useState<CanvasSize | null>(null)
   const [wrapWidth, setWrapWidth] = useState(720)
 
-  // Load the document once per file. Bytes come through the scoped fs plugin
-  // (scope granted in the Rust set_root command) via convertFileSrc + fetch.
+  // Load the document once per file. Bytes come through the fs plugin
+  // (scope granted in the Rust set_root command), bypassing the asset
+  // protocol fetch that WebKit rejects with a bare "Load failed".
   useEffect(() => {
     let cancelled = false
     setDoc(null)
     setLoadError(null)
     setNumPages(0)
-    const url = convertFileSrc(pdfNode.path)
     let task: pdfjs.PDFDocumentLoadingTask | null = null
-    fetch(url)
-      .then((response) => {
-        if (!response.ok) {
-          throw new Error(`fetch failed (${String(response.status)})`)
-        }
-        return response.arrayBuffer()
-      })
+    readPdfBytes(pdfNode.path)
       .then((data) => {
         if (cancelled) return undefined
         task = pdfjs.getDocument({ data })

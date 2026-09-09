@@ -56,7 +56,7 @@ describe('MarkdownPane', () => {
     )
     expect(screen.getByText('first page text')).toBeInTheDocument()
     expect(screen.getByText('second page text')).toBeInTheDocument()
-    expect(screen.getByText('2 pages')).toBeInTheDocument()
+    expect(screen.getByText(/2 pages/)).toBeInTheDocument()
   })
 
   it('shows the empty hint when markdown is null', () => {
@@ -117,6 +117,24 @@ describe('MarkdownPane', () => {
     )
     expect(screen.queryByLabelText(/Show PDF page/)).toBeNull()
     expect(seen).toEqual([])
+  })
+
+  it('jumps pages from the header pager', () => {
+    const seen: number[] = []
+    render(
+      <MarkdownPane
+        markdown={DOC}
+        currentPage={1}
+        syncEnabled={true}
+        scrollToken={0}
+        onJumpPage={(page) => seen.push(page)}
+        emptyHint="empty"
+      />,
+    )
+    expect(screen.getByText(/page 1 \/ 2/)).toBeInTheDocument()
+    fireEvent.click(screen.getByLabelText('Next markdown page'))
+    expect(seen).toEqual([2])
+    expect(screen.getByLabelText('Previous markdown page')).toBeDisabled()
   })
 })
 

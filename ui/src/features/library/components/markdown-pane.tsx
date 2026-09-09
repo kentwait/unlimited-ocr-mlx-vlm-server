@@ -120,6 +120,8 @@ type MarkdownPaneProps = {
   focusSpan?: FocusSpan | null
   /** Markdown -> PDF: the most-visible chunk's page while scrolling. */
   onVisiblePage?: (page: number) => void
+  /** Page selector in this pane's header (mirrors the PDF pager). */
+  onJumpPage?: (page: number) => void
   emptyHint: string
 }
 
@@ -132,6 +134,7 @@ export function MarkdownPane({
   scrollToken,
   focusSpan,
   onVisiblePage,
+  onJumpPage,
   emptyHint,
 }: MarkdownPaneProps): React.JSX.Element {
   const [mode, setMode] = useState<'rendered' | 'source'>('rendered')
@@ -275,8 +278,27 @@ export function MarkdownPane({
             no page anchors — page sync off
           </span>
         ) : (
-          <span className="ml-auto text-xs tabular-nums text-muted-foreground">
+          <span className="ml-auto inline-flex items-center gap-1 text-xs tabular-nums text-muted-foreground">
+            <button
+              type="button"
+              aria-label="Previous markdown page"
+              disabled={currentPage <= (chunks[0]?.page ?? 1)}
+              onClick={() => onJumpPage?.(currentPage - 1)}
+              className="rounded px-1 hover:bg-muted disabled:opacity-40"
+            >
+              ‹
+            </button>
+            page {currentPage} / {chunks[chunks.length - 1]?.page ?? '?'} ·{' '}
             {chunks.length} pages
+            <button
+              type="button"
+              aria-label="Next markdown page"
+              disabled={currentPage >= (chunks[chunks.length - 1]?.page ?? 1)}
+              onClick={() => onJumpPage?.(currentPage + 1)}
+              className="rounded px-1 hover:bg-muted disabled:opacity-40"
+            >
+              ›
+            </button>
           </span>
         )}
       </div>

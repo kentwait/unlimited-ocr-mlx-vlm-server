@@ -488,7 +488,8 @@ export function LibraryPage(): React.JSX.Element {
               pdfNode={selected}
               currentPage={currentPage}
               onPageChange={goPdfPage}
-              spansForPage={spans?.get(currentPage) ?? null}
+              scrollToken={scrollToken}
+              spansByPage={spans}
               syncEnabled={syncEnabled}
               onSpanClick={handleSpanClick}
             />
@@ -520,6 +521,7 @@ export function LibraryPage(): React.JSX.Element {
             scrollToken={scrollToken}
             focusSpan={focusSpan}
             onVisiblePage={handleVisiblePage}
+            onJumpPage={goPdfPage}
             emptyHint={
               selected === null
                 ? 'Select a PDF to see its markdown.'

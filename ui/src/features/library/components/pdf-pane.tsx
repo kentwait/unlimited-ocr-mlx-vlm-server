@@ -21,32 +21,180 @@ type PdfPaneProps = {
   pdfNode: TreeNode
   currentPage: number
   onPageChange: (page: number) => void
-  spansForPage: Span[] | null
+  /** Bumped only by externally-originated jumps (pager, chunk clicks). */
+  scrollToken: number
+  spansByPage: Map<number, Span[]> | null
   syncEnabled: boolean
   /** Overlay -> markdown: clicking a span box jumps to its section. */
-  onSpanClick?: (span: Span) => void
+  onSpanClick: ((span: Span) => void) | undefined
 }
 
-type CanvasSize = { width: number; height: number }
+type PageCanvasProps = {
+  doc: pdfjs.PDFDocumentProxy
+  pageNum: number
+  wrapWidth: number
+  spans: Span[] | null
+  syncEnabled: boolean
+  onSpanClick: ((span: Span) => void) | undefined
+  registerEl: (page: number, el: HTMLDivElement | null) => void
+  onRenderError: (message: string) => void
+}
 
-/** Middle pane: single-page PDF preview with a span-box overlay. */
+/** One page: canvas rendered lazily when scrolled near, plus span overlay. */
+function PageCanvas({
+  doc,
+  pageNum,
+  wrapWidth,
+  spans,
+  syncEnabled,
+  onSpanClick,
+  registerEl,
+  onRenderError,
+}: PageCanvasProps): React.JSX.Element {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null)
+  const wrapEl = useRef<HTMLDivElement | null>(null)
+  const [ready, setReady] = useState(false)
+
+  // Size the canvas from page metadata, then paint pixels when visible.
+  useEffect(() => {
+    // Holder (not a plain boolean): TS narrows locals across awaits, which
+    // would make the cancellation checks look "always truthy" to the linter.
+    // Reads go through a closure for the same reason.
+    const alive = { current: true }
+    const isAlive = (): boolean => alive.current
+    const el = wrapEl.current
+    if (el === null) return undefined
+    registerEl(pageNum, el)
+
+    async function render(): Promise<void> {
+      try {
+        const page = await doc.getPage(pageNum)
+        if (!isAlive()) return
+        const canvas = canvasRef.current
+        if (canvas === null) return
+        const base = page.getViewport({ scale: 1 })
+        const scale = Math.max(0.3, (wrapWidth - 24) / base.width)
+        const viewport = page.getViewport({ scale })
+        canvas.width = Math.ceil(viewport.width)
+        canvas.height = Math.ceil(viewport.height)
+        const ctx = canvas.getContext('2d')
+        if (ctx === null) return
+        await page.render({ canvas, canvasContext: ctx, viewport }).promise
+        if (isAlive()) setReady(true)
+      } catch (cause: unknown) {
+        // No alive check here: reporting into unmounted state is a
+        // harmless no-op in React 18+, and narrowing would flag the check.
+        onRenderError(cause instanceof Error ? cause.message : String(cause))
+      }
+    }
+
+    if (typeof IntersectionObserver === 'undefined') {
+      void render()
+    } else {
+      const observer = new IntersectionObserver(
+        (entries) => {
+          if (entries.some((entry) => entry.isIntersecting)) {
+            observer.disconnect()
+            void render()
+          }
+        },
+        { rootMargin: '800px' },
+      )
+      observer.observe(el)
+      return () => observer.disconnect()
+    }
+    return () => {
+      alive.current = false
+      registerEl(pageNum, null)
+    }
+  }, [doc, pageNum, wrapWidth])
+
+  const rects: OverlayRect[] = useMemo(() => {
+    if (spans === null) return []
+    return spans.map((span) => ({
+      x: (span.box[0] ?? 0) / 1000,
+      y: (span.box[1] ?? 0) / 1000,
+      w: ((span.box[2] ?? 0) - (span.box[0] ?? 0)) / 1000,
+      h: ((span.box[3] ?? 0) - (span.box[1] ?? 0)) / 1000,
+      label: span.label,
+    }))
+  }, [spans])
+
+  return (
+    <div
+      ref={wrapEl}
+      data-page={pageNum}
+      className="relative mx-auto my-3 w-fit"
+    >
+      {!ready ? (
+        <div
+          aria-hidden
+          className="flex h-96 w-[640px] max-w-full animate-pulse items-center justify-center rounded bg-muted/60 text-xs text-muted-foreground"
+        >
+          page {pageNum}…
+        </div>
+      ) : null}
+      <canvas
+        ref={canvasRef}
+        className="block shadow-md"
+        aria-label={`PDF page ${String(pageNum)} preview`}
+      />
+      {syncEnabled && ready
+        ? rects.map((rect, index) => {
+            const span = spans?.[index]
+            const clickable = onSpanClick !== undefined && span !== undefined
+            return (
+              <button
+                key={index}
+                type="button"
+                disabled={!clickable}
+                title={
+                  span !== undefined
+                    ? `${rect.label}: ${span.text.slice(0, 120)}`
+                    : rect.label
+                }
+                aria-label={
+                  clickable
+                    ? `Show markdown for ${rect.label}: ${span.text.slice(0, 80)}`
+                    : rect.label
+                }
+                onClick={clickable ? () => onSpanClick(span) : undefined}
+                className="absolute rounded-[2px] border border-primary/50 bg-primary/10 transition-colors hover:border-primary hover:bg-primary/25 disabled:cursor-default disabled:hover:border-primary/50 disabled:hover:bg-primary/10 enabled:cursor-pointer"
+                style={{
+                  left: `${String(rect.x * 100)}%`,
+                  top: `${String(rect.y * 100)}%`,
+                  width: `${String(rect.w * 100)}%`,
+                  height: `${String(rect.h * 100)}%`,
+                }}
+              />
+            )
+          })
+        : null}
+    </div>
+  )
+}
+
+/** Middle pane: continuously scrolling PDF with per-page span overlays. */
 export function PdfPane({
   pdfNode,
   currentPage,
   onPageChange,
-  spansForPage,
+  scrollToken,
+  spansByPage,
   syncEnabled,
   onSpanClick,
 }: PdfPaneProps): React.JSX.Element {
-  const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const wrapRef = useRef<HTMLDivElement | null>(null)
+  const pageEls = useRef<Map<number, HTMLDivElement>>(new Map())
   const [doc, setDoc] = useState<pdfjs.PDFDocumentProxy | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [renderError, setRenderError] = useState<string | null>(null)
-  const [busy, setBusy] = useState(true)
   const [numPages, setNumPages] = useState(0)
-  const [canvasSize, setCanvasSize] = useState<CanvasSize | null>(null)
   const [wrapWidth, setWrapWidth] = useState(720)
+  const pageForScroll = useRef(currentPage)
+  pageForScroll.current = currentPage
+  const changeRef = useRef(onPageChange)
+  changeRef.current = onPageChange
 
   // Load the document once per file. Bytes come through the fs plugin
   // (scope granted in the Rust set_root command), bypassing the asset
@@ -56,6 +204,7 @@ export function PdfPane({
     setDoc(null)
     setLoadError(null)
     setNumPages(0)
+    pageEls.current.clear()
     let task: pdfjs.PDFDocumentLoadingTask | null = null
     readPdfBytes(pdfNode.path)
       .then((data) => {
@@ -65,6 +214,10 @@ export function PdfPane({
       })
       .then((loaded) => {
         if (loaded === undefined) return
+        if (cancelled) {
+          void task?.destroy()
+          return
+        }
         setDoc(loaded)
         setNumPages(loaded.numPages)
       })
@@ -116,62 +269,65 @@ export function PdfPane({
     return () => observer.disconnect()
   }, [])
 
-  // Render the current page whenever document/page/width changes.
-  useEffect(() => {
-    if (doc === null) return
-    let cancelled = false
-    setBusy(true)
-    setRenderError(null)
-    doc
-      .getPage(currentPage)
-      .then((page) => {
-        if (cancelled) return
-        const canvas = canvasRef.current
-        if (canvas === null) return
-        const base = page.getViewport({ scale: 1 })
-        const scale = Math.max(0.3, (wrapWidth - 24) / base.width)
-        const viewport = page.getViewport({ scale })
-        canvas.width = Math.ceil(viewport.width)
-        canvas.height = Math.ceil(viewport.height)
-        setCanvasSize({ width: canvas.width, height: canvas.height })
-        const ctx = canvas.getContext('2d')
-        if (ctx === null) return
-        return page.render({ canvas, canvasContext: ctx, viewport }).promise
-      })
-      .catch((cause: unknown) => {
-        if (!cancelled) {
-          setRenderError(cause instanceof Error ? cause.message : String(cause))
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setBusy(false)
-      })
-    return () => {
-      cancelled = true
+  const registerEl = useCallback((page: number, el: HTMLDivElement | null) => {
+    if (el === null) {
+      pageEls.current.delete(page)
+    } else {
+      pageEls.current.set(page, el)
     }
-  }, [doc, currentPage, wrapWidth])
+  }, [])
+
+  const onRenderError = useCallback((message: string) => {
+    setRenderError((prev) => prev ?? message)
+  }, [])
+
+  // Scroll-driven page tracking: the most-visible page becomes current.
+  useEffect(() => {
+    const root = wrapRef.current
+    if (
+      doc === null ||
+      numPages === 0 ||
+      root === null ||
+      typeof IntersectionObserver === 'undefined'
+    ) {
+      return
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        let best: { page: number; ratio: number } | null = null
+        for (const entry of entries) {
+          const page = Number(entry.target.getAttribute('data-page'))
+          if (
+            entry.isIntersecting &&
+            Number.isFinite(page) &&
+            (best === null || entry.intersectionRatio > best.ratio)
+          ) {
+            best = { page, ratio: entry.intersectionRatio }
+          }
+        }
+        if (best !== null) changeRef.current(best.page)
+      },
+      { root, threshold: [0.25, 0.5, 0.75] },
+    )
+    for (const el of pageEls.current.values()) observer.observe(el)
+    return () => observer.disconnect()
+  }, [doc, numPages, syncEnabled])
+
+  // Externally-originated jumps (pager, chunk clicks) scroll the page list.
+  useEffect(() => {
+    if (scrollToken === 0) return
+    pageEls.current
+      .get(pageForScroll.current)
+      ?.scrollIntoView({ block: 'start', behavior: 'smooth' })
+  }, [scrollToken])
 
   const goPage = useCallback(
     (delta: number) => {
-      const next = currentPage + delta
-      if (next >= 1 && next <= numPages) onPageChange(next)
+      const next = pageForScroll.current + delta
+      if (next >= 1 && next <= numPages) changeRef.current(next)
     },
-    [currentPage, numPages, onPageChange],
+    [numPages],
   )
-
-  // Overlay rects from this page's spans (box normalized 0-1000).
-  // spanIndex links back to spansForPage for click-through.
-  const rects: (OverlayRect & { spanIndex: number })[] = useMemo(() => {
-    if (spansForPage === null || canvasSize === null) return []
-    return spansForPage.map((span, spanIndex) => ({
-      x: (span.box[0] ?? 0) / 1000,
-      y: (span.box[1] ?? 0) / 1000,
-      w: ((span.box[2] ?? 0) - (span.box[0] ?? 0)) / 1000,
-      h: ((span.box[3] ?? 0) - (span.box[1] ?? 0)) / 1000,
-      label: span.label,
-      spanIndex,
-    }))
-  }, [spansForPage, canvasSize])
 
   const onKeyDown = useCallback(
     (event: React.KeyboardEvent<HTMLDivElement>) => {
@@ -180,6 +336,9 @@ export function PdfPane({
     },
     [goPage],
   )
+
+  const pageNums: number[] =
+    numPages === 0 ? [] : [...Array(numPages).keys()].map((i) => i + 1)
 
   return (
     <div className="flex h-full flex-col" data-testid="pdf-pane">
@@ -205,7 +364,7 @@ export function PdfPane({
         >
           <ChevronRight className="size-4" aria-hidden />
         </Button>
-        {busy ? (
+        {doc === null && loadError === null ? (
           <Loader2
             className="size-3.5 animate-spin text-muted-foreground"
             aria-hidden
@@ -231,46 +390,20 @@ export function PdfPane({
                 : ''}
             </span>
           </div>
-        ) : (
-          <div className="relative mx-auto my-3 w-fit">
-            <canvas
-              ref={canvasRef}
-              className="block shadow-md"
-              aria-label={`PDF page ${String(currentPage)} preview`}
+        ) : doc === null ? null : (
+          pageNums.map((pageNum) => (
+            <PageCanvas
+              key={`${pdfNode.path}:${String(pageNum)}`}
+              doc={doc}
+              pageNum={pageNum}
+              wrapWidth={wrapWidth}
+              spans={spansByPage?.get(pageNum) ?? null}
+              syncEnabled={syncEnabled}
+              onSpanClick={onSpanClick}
+              registerEl={registerEl}
+              onRenderError={onRenderError}
             />
-            {syncEnabled
-              ? rects.map((rect) => {
-                  const span = spansForPage?.[rect.spanIndex]
-                  const clickable =
-                    onSpanClick !== undefined && span !== undefined
-                  return (
-                    <button
-                      key={rect.spanIndex}
-                      type="button"
-                      disabled={!clickable}
-                      title={
-                        span !== undefined
-                          ? `${rect.label}: ${span.text.slice(0, 120)}`
-                          : rect.label
-                      }
-                      aria-label={
-                        clickable
-                          ? `Show markdown for ${rect.label}: ${span.text.slice(0, 80)}`
-                          : rect.label
-                      }
-                      onClick={clickable ? () => onSpanClick(span) : undefined}
-                      className="absolute rounded-[2px] border border-primary/50 bg-primary/10 transition-colors hover:border-primary hover:bg-primary/25 disabled:cursor-default disabled:hover:border-primary/50 disabled:hover:bg-primary/10 enabled:cursor-pointer"
-                      style={{
-                        left: `${String(rect.x * 100)}%`,
-                        top: `${String(rect.y * 100)}%`,
-                        width: `${String(rect.w * 100)}%`,
-                        height: `${String(rect.h * 100)}%`,
-                      }}
-                    />
-                  )
-                })
-              : null}
-          </div>
+          ))
         )}
         {renderError !== null ? (
           <div role="alert" className="m-4 text-sm text-destructive">

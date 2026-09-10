@@ -767,6 +767,7 @@ def test_status_shape_exact(monkeypatch):
         "loaded": False,
         "progress": None,
         "detail": runtime.detail,
+        "download_target": None,
         "models": [
             {
                 "id": "test/model",
@@ -1300,3 +1301,22 @@ def test_real_models_status_active_only_when_ready(monkeypatch):
     runtime.state = "ready"
     active = [model["id"] for model in runtime.models() if model["active"]]
     assert active == [runtime.model_ref]
+
+
+def test_status_reports_download_target_scope():
+    runtime = AssistantRuntime("m")
+    runtime.available = True
+    runtime._download_target = "target/model"
+    runtime.state = "downloading"
+    assert runtime.status()["download_target"] == "target/model"
+    runtime.state = "paused"
+    assert runtime.status()["download_target"] == "target/model"
+    runtime.state = "ready"
+    assert runtime.status()["download_target"] is None
+
+
+def test_fake_cancel_keeps_download_target(client, fake_runtime):
+    client.post("/assistant/model/download", json={"model": INT4})
+    body = client.post("/assistant/model/cancel").json()
+    assert body["state"] == "paused"
+    assert body["download_target"] == INT4

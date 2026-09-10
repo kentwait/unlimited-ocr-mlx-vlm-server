@@ -81,4 +81,6 @@ class AssistantStatus(BaseModel):
     loaded: bool = False  # weights resident in memory
     progress: float | None = None  # 0..1 while downloading
     detail: str | None = None  # failure explanation
+    #: model id being downloaded, while downloading or paused
+    download_target: str | None = None
     models: list[AssistantModel] = []  # catalog with per-entry state

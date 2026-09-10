@@ -277,6 +277,11 @@ class AssistantRuntime:
             "loaded": self.loaded,
             "progress": self.progress,
             "detail": self.detail,
+            "download_target": (
+                self._download_target
+                if self.state in (STATE_DOWNLOADING, STATE_PAUSED)
+                else None
+            ),
             "models": self._models_status(),
         }
 
@@ -674,6 +679,7 @@ class FakeAssistantRuntime(AssistantRuntime):
 
     def start_download(self, model: str | None = None) -> None:
         target = model or self.model_ref
+        self._download_target = target
         self._fake_downloaded.add(target)
         self.model_ref = target
         self.loaded = True
@@ -684,11 +690,13 @@ class FakeAssistantRuntime(AssistantRuntime):
     def cancel_download(self) -> None:
         self.state = STATE_PAUSED
         self.detail = "download cancelled"
+        self._download_target = self._download_target or self.model_ref
 
     def use(self, model: str) -> None:
         if model not in self._fake_downloaded:
             raise ModelNotReady(f"assistant model {model} is not downloaded")
         self.model_ref = model
+        self._download_target = None
         self.loaded = True
         self.state = STATE_READY
         self.progress = 1.0

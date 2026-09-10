@@ -756,7 +756,9 @@ def test_sampling_kwargs_full_shape():
 def test_status_shape_exact(monkeypatch):
     runtime = AssistantRuntime("test/model")
     monkeypatch.setattr(
-        runtime, "_is_downloaded", lambda ref: ref == "test/model"
+        runtime,
+        "_cache_state",
+        lambda ref: "complete" if ref == "test/model" else "absent",
     )
     monkeypatch.setattr(runtime, "_size_bytes", lambda ref: 123)
     status = runtime.status()
@@ -775,6 +777,7 @@ def test_status_shape_exact(monkeypatch):
                 "bits": 0,
                 "size_bytes": 123,
                 "downloaded": True,
+                "partial": False,
                 "active": False,
             },
             {
@@ -783,6 +786,7 @@ def test_status_shape_exact(monkeypatch):
                 "bits": 8,
                 "size_bytes": 123,
                 "downloaded": False,
+                "partial": False,
                 "active": False,
             },
             {
@@ -791,6 +795,7 @@ def test_status_shape_exact(monkeypatch):
                 "bits": 4,
                 "size_bytes": 123,
                 "downloaded": False,
+                "partial": False,
                 "active": False,
             },
         ],
@@ -831,13 +836,15 @@ def test_is_downloaded_snapshot_success(monkeypatch):
     assert runtime._is_downloaded(runtime.model_ref) is True
 
 
-def test_is_downloaded_falls_back_to_cached_config(monkeypatch):
+def test_is_downloaded_rejects_incomplete_snapshot(monkeypatch):
     def boom(*args, **kwargs):
         raise RuntimeError("incomplete snapshot")
 
+    # A cached config alone must not read as downloaded; the snapshot is
+    # incomplete (or absent), so Use/chat must not treat it as ready.
     _stub_hub(monkeypatch, boom, "/cache/config.json")
     runtime = AssistantRuntime()
-    assert runtime._is_downloaded(runtime.model_ref) is True
+    assert runtime._is_downloaded(runtime.model_ref) is False
 
 
 def test_is_downloaded_false_without_cache(monkeypatch):
@@ -1128,7 +1135,9 @@ def test_models_endpoint_lists_catalog(client, fake_runtime):
 
 
 def test_models_endpoint_unavailable(client, unavailable_runtime, monkeypatch):
-    monkeypatch.setattr(unavailable_runtime, "_is_downloaded", lambda ref: False)
+    monkeypatch.setattr(
+        unavailable_runtime, "_cache_state", lambda ref: "absent"
+    )
     body = client.get("/assistant/models").json()
     assert body["available"] is False
     assert len(body["models"]) == len(assistant_mod.MODEL_CATALOG)
@@ -1375,3 +1384,42 @@ def test_download_does_not_hijack_a_loaded_model(monkeypatch):
     assert runtime.model_ref == INT8
     assert runtime.loaded is True
     assert runtime.state == "ready"
+
+
+# ---------- cache completion is strict (partial is not downloaded) ----------
+
+
+def test_cache_state_complete_when_snapshot_ok(monkeypatch):
+    runtime = AssistantRuntime()
+    _stub_hub(monkeypatch, lambda *a, **k: "/cache", None)
+    assert runtime._cache_state("org/model") == "complete"
+
+
+def test_cache_state_partial_when_incomplete_and_dir_exists(
+    monkeypatch, tmp_path
+):
+    runtime = AssistantRuntime()
+    monkeypatch.setattr(runtime, "_cache_dir", lambda ref: tmp_path)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("incomplete snapshot")
+
+    _stub_hub(monkeypatch, boom, None)
+    assert runtime._cache_state("org/model") == "partial"
+    monkeypatch.setattr(runtime, "_cache_dir", lambda ref: tmp_path / "missing")
+    assert runtime._cache_state("org/model") == "absent"
+
+
+def test_models_status_reports_partial(monkeypatch):
+    runtime = AssistantRuntime()
+    runtime.available = True
+    monkeypatch.setattr(runtime, "_size_bytes", lambda ref: None)
+    monkeypatch.setattr(
+        runtime,
+        "_cache_state",
+        lambda ref: "partial" if ref == assistant_mod.DEFAULT_MODEL else "absent",
+    )
+    entries = {model["id"]: model for model in runtime.models()}
+    default = entries[assistant_mod.DEFAULT_MODEL]
+    assert default["downloaded"] is False
+    assert default["partial"] is True

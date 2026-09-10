@@ -54,7 +54,8 @@ class AssistantModel(BaseModel):
     label: str  # short quantization label, e.g. "int8"
     bits: int  # quantization width (0 when unknown)
     size_bytes: int | None = None  # aggregate Hub size, null while unknown
-    downloaded: bool = False  # weights present in the local HF cache
+    downloaded: bool = False  # complete snapshot present in the local HF cache
+    partial: bool = False  # a cancelled/in-progress cache (resumable)
     active: bool = False  # the model currently selected/loaded
 
 

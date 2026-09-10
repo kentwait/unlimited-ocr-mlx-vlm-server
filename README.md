@@ -99,7 +99,10 @@ one is loaded at a time.
 - `GET /assistant/status` — `{available, state, model, loaded, progress,
   detail, models}` with state `not_downloaded | downloading | paused |
   loading | ready | failed`; `models` carries per-entry
-  `{id, label, bits, size_bytes, downloaded, active}`.
+  `{id, label, bits, size_bytes, downloaded, partial, active}`. `downloaded`
+  means a *complete* snapshot (`snapshot_download(local_files_only=True)`
+  succeeds); a cancelled/in-progress cache reports `partial: true` so clients
+  offer Resume rather than Use.
 - `GET /assistant/models` — the catalog and per-entry state.
 - `POST /assistant/model/download {model?}` — explicit, idempotent,
   resumable download (Hugging Face cache), then load. Defaults to the

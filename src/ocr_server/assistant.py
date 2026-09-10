@@ -251,17 +251,21 @@ class AssistantRuntime:
             if self.loaded or self.state in (STATE_READY, STATE_LOADING)
             else None
         )
-        return [
-            {
-                "id": spec.id,
-                "label": spec.label,
-                "bits": spec.bits,
-                "size_bytes": self._size_bytes(spec.id),
-                "downloaded": self._is_downloaded(spec.id),
-                "active": spec.id == active,
-            }
-            for spec in self._catalog()
-        ]
+        entries = []
+        for spec in self._catalog():
+            state = self._cache_state(spec.id)
+            entries.append(
+                {
+                    "id": spec.id,
+                    "label": spec.label,
+                    "bits": spec.bits,
+                    "size_bytes": self._size_bytes(spec.id),
+                    "downloaded": state == "complete",
+                    "partial": state == "partial",
+                    "active": spec.id == active,
+                }
+            )
+        return entries
 
     def models(self) -> list[dict[str, Any]]:
         """Catalog with per-entry downloaded/active state."""
@@ -285,27 +289,31 @@ class AssistantRuntime:
             "models": self._models_status(),
         }
 
-    def _is_downloaded(self, ref: str) -> bool:
+    def _cache_state(self, ref: str) -> str:
+        """``complete`` | ``partial`` | ``absent`` for a model's HF cache.
+
+        Completion is strict: ``snapshot_download(local_files_only=True)``
+        succeeds only when every file (weights included) is present and the
+        snapshot metadata is intact, and raises ``IncompleteSnapshotError`` for
+        a cancelled/in-progress download. A config-only cache must never read
+        as downloaded, or Use would silently resume the download.
+        """
         try:
             from huggingface_hub import snapshot_download
-            from huggingface_hub import try_to_load_from_cache
         except ImportError:  # pragma: no cover - extra missing
-            return False
+            return "absent"
         try:
             snapshot_download(ref, local_files_only=True)
-            return True
+            return "complete"
         except Exception:
-            # Newer hubs raise IncompleteSnapshotError for caches written by
-            # other tools (missing metadata files) even when the weights are
-            # present — and that error subclasses LocalEntryNotFoundError; a
-            # cached config is the practical signal, since loading can
-            # complete the snapshot when the network is available.
             pass
-        try:
-            cached = try_to_load_from_cache(ref, "config.json")
-            return isinstance(cached, str)
-        except Exception:  # pragma: no cover - defensive
-            return False
+        cache = self._cache_dir(ref)
+        if cache is not None and cache.exists():
+            return "partial"
+        return "absent"
+
+    def _is_downloaded(self, ref: str) -> bool:
+        return self._cache_state(ref) == "complete"
 
     def start_download(self, model: str | None = None) -> None:
         """Kick off download+load of an entry in the background (idempotent)."""
@@ -689,8 +697,8 @@ class FakeAssistantRuntime(AssistantRuntime):
         self.detail = None
         self._fake_downloaded = {DEFAULT_MODEL, self.model_ref}
 
-    def _is_downloaded(self, ref: str) -> bool:  # pragma: no cover - trivial
-        return ref in self._fake_downloaded
+    def _cache_state(self, ref: str) -> str:  # pragma: no cover - trivial
+        return "complete" if ref in self._fake_downloaded else "absent"
 
     def _size_bytes(self, ref: str) -> int | None:  # pragma: no cover - trivial
         return {

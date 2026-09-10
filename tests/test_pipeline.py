@@ -1,282 +1,190 @@
-"""Full pipeline with stubbed LLM: fake OCR engine + canned checker output.
-
-Covers the cleanup/reflow branches that need no MLX weights by stubbing
-CleanupEngine._generate/_load. Real weight paths stay pragma-marked.
-"""
+"""End-to-end pipeline tests on the committed fixture (real engines, no mocks)."""
 
 from __future__ import annotations
 
-import time
+import json
+from pathlib import Path
 
 import pytest
-from fastapi import Request
-from fastapi.testclient import TestClient
+from fastapi import HTTPException
 
-from ocr_server import api as api_mod
-from ocr_server import cleanup as cleanup_mod
-from ocr_server.api import app, holder
-from ocr_server.fake import FakeEngine
+from ocr_server.pipeline import parse_pdf
+from ocr_server.pp_layout import LayoutModel
+from ocr_server.schemas import JobStatus
 
-from test_api import _pdf_bytes, _png_bytes
+from conftest import PDF_PATH, make_image_pdf, make_text_pdf
 
-TOKEN = "pipeline-token"
-
-
-def _echo_fragments(self, prompt, max_tokens):
-    """Stub LLM: echo the numbered fragment block back unchanged."""
-    start = prompt.index("<<<FRAGMENTS") + len("<<<FRAGMENTS\n")
-    end = prompt.index("FRAGMENTS>>>")
-    return prompt[start:end].strip(), 5, False
+#: Pages with real figures in the fixture (verified visually).
+FIGURE_PAGES = {1, 3, 5, 6, 8, 9}
 
 
-def _canonical_output(self, prompt, max_tokens):
-    """Stub LLM: fixed non-fragment output (for reflow paths)."""
-    return "canonical output", 5, False
+@pytest.fixture(scope="module")
+def model() -> LayoutModel:
+    return LayoutModel().load()
 
 
 @pytest.fixture()
-def stubbed_llm(monkeypatch):
-    monkeypatch.setattr(cleanup_mod.CleanupEngine, "load", lambda self: None)
-    yield
+def fixture_pdf(tmp_path: Path) -> Path:
+    path = tmp_path / "altemose2022.pdf"
+    path.write_bytes(PDF_PATH.read_bytes())
+    return path
 
 
-@pytest.fixture()
-def client(monkeypatch, stubbed_llm):
-    monkeypatch.setenv("OCR_FAKE_ENGINE", "1")
-    monkeypatch.setenv("OCR_INTERNAL_TOKEN", TOKEN)
-    holder.load()
-    with TestClient(app) as c:
-        # Lifespan re-loads the holder on entry: flip to the stubbed-LLM
-        # configuration only after it runs.
-        monkeypatch.setattr(api_mod, "_cleanup_engine", None)
-        holder.is_fake = False
-        holder.engine = FakeEngine()
-        holder.engine.load()
-        yield c
-    holder.engine = None
-    holder.is_fake = False
-    monkeypatch.setattr(api_mod, "_cleanup_engine", None)
+def _spans(page_result) -> list[dict]:
+    return [json.loads(line) for line in page_result.spans_jsonl.splitlines()]
 
 
-def test_pdf_pipeline_with_cleanup(client, monkeypatch):
-    # Checker echoes fragments: corrected spans == original spans, so the
-    # markdown must be exactly the deterministic render of those spans.
-    monkeypatch.setattr(cleanup_mod.CleanupEngine, "_generate", _echo_fragments)
-    r = client.post(
-        "/parse/pdf",
-        files={"file": ("t.pdf", _pdf_bytes(2), "application/pdf")},
-        data={"pages": "all"},
-    )
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["n_pages"] == 2
-    page = body["results"][0]
-    assert page["markdown"] == "MOCK(page-0001.png|document parsing.)"
-    assert page["cleanup_method"] == "check-spans-proofread"
-    assert page["corrections"]["formatting_only"] is True
-    assert body["furniture"]["template"] is None
-    # Spans are the authoritative output and carry identity.
-    import json as _json
+def test_full_document_figures_and_labels(fixture_pdf, model):
+    response = parse_pdf(fixture_pdf, pages="all", dpi=150, layout_model=model)
+    assert response.kind == "pdf"
+    assert response.n_pages == 13
+    assert response.total_elapsed_s >= 0
 
-    spans = [_json.loads(line) for line in page["spans_jsonl"].splitlines()]
-    assert spans[0]["id"] == "p1-1"
-    assert spans[0]["text"] == "MOCK(page-0001.png|document parsing.)"
+    figure_pages = set()
+    for page in response.results:
+        assert page.warnings == []
+        spans = _spans(page)
+        assert spans, f"page {page.page} produced no spans"
 
+        ids = [span["id"] for span in spans]
+        assert ids == [f"p{page.page}-{i + 1}" for i in range(len(spans))]
+        assert len(set(ids)) == len(ids)
+        assert all(span["page"] == page.page for span in spans)
+        assert not any(span["label"] == "picture" for span in spans)
 
-def test_pdf_pipeline_applies_checker_corrections(client, monkeypatch):
-    def fix_typo(self, prompt, max_tokens):
-        block = _echo_fragments(self, prompt, max_tokens)[0]
-        return block.replace("MOCK", "MARK"), 5, False
+        figures = [span for span in spans if "image" in span]
+        if figures:
+            figure_pages.add(page.page)
+            for figure in figures:
+                assert figure["label"] == "image"
+                assert figure["image"].startswith("data:image/png;base64,")
+                assert len(figure["image"]) > 1000
+                # page + box stay on the span for reconstitution.
+                assert figure["page"] == page.page
+                assert len(figure["box"]) == 4
 
-    monkeypatch.setattr(cleanup_mod.CleanupEngine, "_generate", fix_typo)
-    r = client.post(
-        "/parse/pdf",
-        files={"file": ("t.pdf", _pdf_bytes(1), "application/pdf")},
-        data={"pages": "all"},
-    )
-    assert r.status_code == 200, r.text
-    body = r.json()
-    page = body["results"][0]
-    assert "MARK(page-0001.png" in page["markdown"]
-    import json as _json
+    assert figure_pages == FIGURE_PAGES
 
-    spans = [_json.loads(line) for line in page["spans_jsonl"].splitlines()]
-    assert spans[0]["text"].startswith("MARK(")
-    assert page["corrections"]["formatting_only"] is False
+    # Furniture is labeled and content survives across the document.
+    all_spans = [span for page in response.results for span in _spans(page)]
+    assert sum(1 for s in all_spans if s["label"] == "header") >= 10
+    assert sum(1 for s in all_spans if s["label"] == "footer") >= 20
+    assert sum(1 for s in all_spans if s["label"] == "text") > 50
+    assert any(s["label"] == "title" for s in all_spans)
 
 
-def test_image_pipeline_with_cleanup(client, monkeypatch):
-    monkeypatch.setattr(cleanup_mod.CleanupEngine, "_generate", _echo_fragments)
-    r = client.post(
-        "/parse/image",
-        files={"file": ("t.png", _png_bytes(), "image/png")},
-    )
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["results"][0]["cleanup_method"] == "check-spans-proofread"
+def test_subset_pages_only(fixture_pdf, model):
+    response = parse_pdf(fixture_pdf, pages="2", dpi=150, layout_model=model)
+    assert [page.page for page in response.results] == [2]
+    assert not any("image" in span for span in _spans(response.results[0]))
 
 
-def test_reflow_real_path_with_audit(client, monkeypatch):
-    monkeypatch.setattr(cleanup_mod.CleanupEngine, "_generate", _canonical_output)
-    r = client.post(
-        "/internal/reflow",
-        json={
-            "contract_version": 1,
-            "journal": "science",
-            "markdown": "# Title\n\nSome body text here.",
-            "prompt_override": "Reflow {{journal}}:\n\n{{markdown}}",
-        },
-        headers={"Authorization": f"Bearer {TOKEN}"},
-    )
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["method"] == "reflow+journal-prompt"
-    assert body["markdown"] == "canonical output"
-    assert body["corrections"]["formatting_only"] is False
-    assert "Qwen" in (body["model"] or "")
-
-
-def test_reflow_loopback_guard_unit():
-    def scope(host):
-        return {
-            "type": "http",
-            "method": "POST",
-            "path": "/internal/reflow",
-            "headers": [(b"authorization", b"Bearer x")],
-            "client": (host, 1234),
-        }
-
-    import os
-
-    from fastapi import HTTPException
-
-    os.environ["OCR_INTERNAL_TOKEN"] = "t"
-    try:
-        with pytest.raises(HTTPException) as exc:
-            api_mod._require_internal_access(Request(scope("192.168.1.5")))
-        assert exc.value.status_code == 403
-        with pytest.raises(HTTPException) as exc:
-            api_mod._require_internal_access(Request({**scope("x"), "client": None}))
-        assert exc.value.status_code == 403
-    finally:
-        del os.environ["OCR_INTERNAL_TOKEN"]
-
-
-def test_root_and_upload_validation(client):
-    assert client.get("/").json()["service"] == "unlimited-ocr-server"
-    r = client.post(
-        "/parse/pdf",
-        files={"file": ("empty.pdf", b"", "application/pdf")},
-        data={"pages": "all"},
-    )
-    assert r.status_code == 400
-    r = client.post(
-        "/parse/image",
-        files={"file": ("t.txt", b"nope", "text/plain")},
-        data={},
-    )
-    assert r.status_code == 415
-
-
-def test_oversize_upload_rejected(client, monkeypatch):
-    monkeypatch.setattr(api_mod, "MAX_UPLOAD_BYTES", 10)
-    r = client.post(
-        "/parse/pdf",
-        files={"file": ("t.pdf", _pdf_bytes(1), "application/pdf")},
-        data={"pages": "all"},
-    )
-    assert r.status_code == 413
-
-
-def test_job_flow_with_cleanup_tracks_phase(client, monkeypatch):
-    monkeypatch.setattr(cleanup_mod.CleanupEngine, "_generate", _echo_fragments)
-    r = client.post(
-        "/parse/jobs",
-        files={"file": ("t.pdf", _pdf_bytes(2), "application/pdf")},
-        data={"pages": "all"},
-    )
-    assert r.status_code == 202, r.text
-    job_id = r.json()["job_id"]
-    for _ in range(100):
-        s = client.get(f"/parse/jobs/{job_id}")
-        if s.json()["status"] in ("done", "error"):
-            break
-        time.sleep(0.05)
-    body = s.json()
-    assert body["status"] == "done", body
-    assert body["result"]["results"][0]["cleanup_method"] == "check-spans-proofread"
-
-
-def test_infer_defaults_to_holder_engine(client, tmp_path):
-    import asyncio
-    from pathlib import Path
-
-    from PIL import Image
-
-    from ocr_server.schemas import InferenceParams
-
-    img = tmp_path / "probe.png"
-    Image.new("RGB", (8, 8)).save(img)
-    text, _, _ = asyncio.run(
-        api_mod._infer_image_path(img, InferenceParams(prompt="document parsing."))
-    )
-    assert "MOCK" in text
-
-
-def test_parse_pdf_path_rejects_bad_furniture(client, tmp_path):
-    import asyncio
-
-    from ocr_server.schemas import InferenceParams
-
-    pdf = tmp_path / "t.pdf"
-    pdf.write_bytes(_pdf_bytes(1))
-    with pytest.raises(Exception, match="unknown furniture mode"):
-        asyncio.run(
-            api_mod._parse_pdf_path(
-                pdf,
-                pages="all",
-                dpi=100,
-                params=InferenceParams(prompt="document parsing."),
-                furniture="bogus",
-            )
-        )
-
-
-def test_parse_pdf_path_tracks_cleanup_progress(client, tmp_path, monkeypatch):
-    import asyncio
-    import time
-
-    monkeypatch.setattr(cleanup_mod.CleanupEngine, "_generate", _echo_fragments)
-
-    from ocr_server.schemas import InferenceParams, JobStatus
-
-    pdf = tmp_path / "t.pdf"
-    pdf.write_bytes(_pdf_bytes(2))
-    job = JobStatus(job_id="x", status="running", created_at=time.time())
-    resp = asyncio.run(
-        api_mod._parse_pdf_path(
-            pdf,
-            pages="all",
-            dpi=100,
-            params=InferenceParams(prompt="document parsing."),
-            journal="nature",
-            job=job,
-        )
-    )
-    assert resp.journal == "nature"
-    assert job.phase == "cleanup"
+def test_job_progress_is_reported(fixture_pdf, model):
+    job = JobStatus(job_id="x", status="running", created_at=0.0)
+    response = parse_pdf(fixture_pdf, pages="1-2", dpi=150, layout_model=model, job=job)
+    assert job.phase == "parse"
     assert job.pages_total == 2
-    # Fresh per-stage count: every page checked, none beyond the total.
     assert job.pages_done == 2
+    assert len(response.results) == 2
 
 
-def test_image_inference_failure_is_500(client, monkeypatch):
+def test_crop_failure_degrades_with_warning(fixture_pdf, model, monkeypatch):
+    import ocr_server.pipeline as pipeline
+
+    monkeypatch.setattr(pipeline, "crop_data_uri", lambda *a, **k: None)
+    response = parse_pdf(fixture_pdf, pages="1", dpi=150, layout_model=model)
+    page = response.results[0]
+    figures = [span for span in _spans(page) if span["label"] == "image"]
+    assert figures and "image" not in figures[0]
+    assert page.warnings == ["figure crop failed on page 1"]
+
+
+def test_text_pdf_parses_without_figures(tmp_path, model):
+    path = tmp_path / "text.pdf"
+    path.write_bytes(make_text_pdf(1))
+    response = parse_pdf(path, pages="all", dpi=150, layout_model=model)
+    spans = _spans(response.results[0])
+    assert spans
+    assert all(span["label"] != "image" for span in spans)
+    assert any("Test page 1" in span["text"] for span in spans)
+
+
+def test_scanned_pdf_errors_with_page_list(tmp_path, model):
+    path = tmp_path / "scan.pdf"
+    path.write_bytes(make_image_pdf())
+    with pytest.raises(HTTPException) as excinfo:
+        parse_pdf(path, pages="all", dpi=150, layout_model=model)
+    assert excinfo.value.status_code == 400
+    assert "no text layer on page(s) 1" in excinfo.value.detail
+    assert "digital-born" in excinfo.value.detail
+
+
+def test_too_many_pages_rejected(tmp_path, model):
+    path = tmp_path / "many.pdf"
+    path.write_bytes(make_text_pdf(51))
+    with pytest.raises(HTTPException) as excinfo:
+        parse_pdf(path, pages="all", dpi=150, layout_model=model)
+    assert excinfo.value.status_code == 400
+    assert "max 50" in excinfo.value.detail
+
+
+def test_bad_pages_spec_rejected(fixture_pdf, model):
+    with pytest.raises(HTTPException) as excinfo:
+        parse_pdf(fixture_pdf, pages="1-100", dpi=150, layout_model=model)
+    assert excinfo.value.status_code == 400
+    assert "out of range" in excinfo.value.detail
+
+
+def test_bad_dpi_rejected(fixture_pdf, model):
+    with pytest.raises(HTTPException) as excinfo:
+        parse_pdf(fixture_pdf, pages="1", dpi=600, layout_model=model)
+    assert excinfo.value.status_code == 400
+    assert "dpi must be 72-300" in excinfo.value.detail
+
+
+def test_unreadable_pdf_rejected(tmp_path, model):
+    path = tmp_path / "broken.pdf"
+    path.write_bytes(b"definitely not a pdf")
+    with pytest.raises(HTTPException) as excinfo:
+        parse_pdf(path, pages="all", dpi=150, layout_model=model)
+    assert excinfo.value.status_code == 400
+    assert "cannot open PDF" in excinfo.value.detail
+
+
+def test_extract_failure_maps_to_400(fixture_pdf, model, monkeypatch):
+    import ocr_server.pipeline as pipeline
+
     def boom(*args, **kwargs):
-        raise RuntimeError("gpu gone")
+        raise RuntimeError("layout exploded")
 
-    monkeypatch.setattr(FakeEngine, "infer_image_file", boom)
-    r = client.post(
-        "/parse/image",
-        files={"file": ("t.png", _png_bytes(), "image/png")},
-    )
-    assert r.status_code == 500
+    monkeypatch.setattr(pipeline, "extract_boxes", boom)
+    with pytest.raises(HTTPException) as excinfo:
+        parse_pdf(fixture_pdf, pages="1", dpi=150, layout_model=model)
+    assert excinfo.value.status_code == 400
+    assert "cannot extract text layout" in excinfo.value.detail
+
+
+def test_extract_http_exception_passes_through(fixture_pdf, model, monkeypatch):
+    import ocr_server.pipeline as pipeline
+
+    def boom(*args, **kwargs):
+        raise HTTPException(418, "teapot layout")
+
+    monkeypatch.setattr(pipeline, "extract_boxes", boom)
+    with pytest.raises(HTTPException) as excinfo:
+        parse_pdf(fixture_pdf, pages="1", dpi=150, layout_model=model)
+    assert excinfo.value.status_code == 418
+    assert excinfo.value.detail == "teapot layout"
+
+
+def test_render_failure_maps_to_400(fixture_pdf, model, monkeypatch):
+    import ocr_server.pipeline as pipeline
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("render exploded")
+
+    monkeypatch.setattr(pipeline, "render_pdf_pages", boom)
+    with pytest.raises(HTTPException) as excinfo:
+        parse_pdf(fixture_pdf, pages="1", dpi=150, layout_model=model)
+    assert excinfo.value.status_code == 400
+    assert "render failed" in excinfo.value.detail

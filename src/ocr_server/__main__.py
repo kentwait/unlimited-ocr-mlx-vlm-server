@@ -10,30 +10,24 @@ import uvicorn
 
 
 def main() -> None:
-    # Route ocr_server.* loggers (checker edits, page/request summaries) to
-    # stderr at INFO so they appear alongside uvicorn's request logs.
+    # Route ocr_server.* loggers (page/request summaries) to stderr at INFO so
+    # they appear alongside uvicorn's request logs.
     logging.basicConfig(
         level=os.environ.get("OCR_LOG_LEVEL", "INFO").upper(),
         format="%(levelname)s:     %(name)s - %(message)s",
     )
-    parser = argparse.ArgumentParser(description="Unlimited-OCR MLX FastAPI server")
+    parser = argparse.ArgumentParser(description="Paperhub PDF parser (FastAPI)")
     parser.add_argument("--host", default=os.environ.get("OCR_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("OCR_PORT", "8300")))
     parser.add_argument(
-        "--model-ref",
-        default=os.environ.get("OCR_MODEL_REF", "sahilchachra/unlimited-ocr-mxfp8-mlx"),
-        help="HF repo id or local path of the MLX model",
-    )
-    parser.add_argument(
-        "--fake-engine",
-        action="store_true",
-        help="Use a stub engine (no model) for API development/testing",
+        "--layout-model",
+        default=os.environ.get("OCR_LAYOUT_MODEL", ""),
+        help="Path to a PP-DocLayout-S ONNX file (defaults to the vendored model)",
     )
     args = parser.parse_args()
 
-    os.environ["OCR_MODEL_REF"] = args.model_ref
-    if args.fake_engine:
-        os.environ["OCR_FAKE_ENGINE"] = "1"
+    if args.layout_model:
+        os.environ["OCR_LAYOUT_MODEL"] = args.layout_model
 
     uvicorn.run(
         "ocr_server.api:app",

@@ -18,6 +18,14 @@ the 4.7 MB PP-DocLayout-S ONNX export is vendored under
 `src/ocr_server/models/` (SHA pinned by `test_pp.py`). The suite runs on any
 platform, including CI.
 
+## Assistant tests
+
+`test_assistant_parser.py` (XML tool-call extraction, streaming filter,
+message conversion, Hypothesis properties) and `test_assistant_api.py`
+(fake runtime lifecycle, guards, SSE shapes, cancellation) run without MLX;
+weight-dependent paths carry `# pragma: no cover`. The `OCR_ASSISTANT_FAKE=1`
+runtime is also what `scripts/contract-check.mjs` uses in the app repo.
+
 ## Coverage
 
 `make coverage` enforces **95%** (`--cov-fail-under=95`; currently 100%).

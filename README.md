@@ -78,6 +78,28 @@ One JSON object per line:
 4. Merge: picture boxes replaced by figure spans at their reading position,
    content inside figures relabeled `figure_text`, ids assigned.
 
+## Assistant (optional)
+
+The server can also host the local chat model Paperhub uses. This is optional
+and Apple-Silicon-only; parsing works without it.
+
+```bash
+uv sync --extra assistant                                        # mlx-vlm + huggingface-hub
+uv run ocr-server                                                # hosts /assistant/* and /v1/chat/completions
+OCR_ASSISTANT_FAKE=1 uv run ocr-server                           # deterministic fake (CI, UI dev)
+uv run ocr-server --assistant-model mlx-community/Qwen3.5-9B-MLX-8bit
+```
+
+- `GET /assistant/status` — `{available, state, model, loaded, progress, detail}`
+  with state `not_downloaded | downloading | loading | ready | failed`.
+- `POST /assistant/model/download` — explicit, idempotent download (~9.7 GB,
+  Hugging Face cache) followed by load.
+- `POST /v1/chat/completions` — OpenAI-compatible subset (`messages`,
+  `tools`, `stream`). Streaming replies are SSE `data:` chunks; Qwen XML
+  tool calls are parsed into OpenAI `tool_calls` deltas; `<think>` content
+  is stripped. Without the extra (or an unloaded model) the endpoints return
+  501/409 so the app can explain the state.
+
 ## Testing
 
 ```bash

@@ -230,10 +230,14 @@ def test_main_sets_layout_model_env(monkeypatch):
         ["ocr-server", "--port", "9999", "--layout-model", "/tmp/custom.onnx"],
     )
     monkeypatch.delenv("OCR_LAYOUT_MODEL", raising=False)
-    cli.main()
-    assert seen["target"][0] == "ocr_server.api:app"
-    assert seen["kwargs"]["port"] == 9999
-    assert os.environ["OCR_LAYOUT_MODEL"] == "/tmp/custom.onnx"
+    try:
+        cli.main()
+        assert seen["target"][0] == "ocr_server.api:app"
+        assert seen["kwargs"]["port"] == 9999
+        assert os.environ["OCR_LAYOUT_MODEL"] == "/tmp/custom.onnx"
+    finally:
+        # main() set the env directly; monkeypatch cannot undo that.
+        os.environ.pop("OCR_LAYOUT_MODEL", None)
 
 
 def test_main_without_layout_model_keeps_env(monkeypatch):
@@ -404,3 +408,88 @@ def test_picture_matches_by_iou_or_containment():
 def test_capture_classes_are_figures_only():
     assert CAPTURE_CLASSES == {"image", "chart"}
     assert DEDUPE_IOU > 0.5
+
+# ---------- exact-value pins (mutation-hardening) ----------
+
+
+def test_render_pdf_pages_scales_by_dpi(tmp_path):
+    doc = pymupdf.open(stream=make_text_pdf(1), filetype="pdf")
+    try:
+        paths = render_pdf_pages(doc, [1], 144, tmp_path)
+        from PIL import Image
+
+        with Image.open(paths[0]) as image:
+            # 612x792pt at 72dpi -> x2 at 144dpi.
+            assert image.size == (1224, 1584)
+    finally:
+        doc.close()
+
+
+def test_iou_exact_values():
+    assert _iou([0, 0, 10, 10], [0, 0, 10, 10]) == 1.0
+    assert _iou([0, 0, 10, 10], [10, 0, 20, 10]) == 0.0
+    partial = _iou([0, 0, 10, 10], [5, 0, 15, 10])
+    assert abs(partial - (50 / 150)) < 1e-12
+
+
+def test_center_inside_boundaries():
+    # Center exactly on the outer box edge counts as inside.
+    assert _center_inside([0, 0, 10, 10], [5, 5, 15, 15])
+    assert not _center_inside([0, 0, 10, 10], [10, 10, 20, 20])
+
+
+def test_clean_regions_threshold_boundaries():
+    exact_score = _row(1, SCORE_MIN, [0, 0, 400, 400])
+    below = _row(1, SCORE_MIN - 0.001, [500, 0, 900, 400])
+    kept = clean_regions([exact_score, below], 1, 1000, 1000)
+    assert [r.box for r in kept] == [[0, 0, 400, 400]]
+
+    exact_dim = _row(1, 0.9, [0, 0, MIN_DIM, 400])
+    under = _row(1, 0.9, [500, 0, 500 + MIN_DIM - 1, 400])
+    kept = clean_regions([exact_dim, under], 1, 1000, 1000)
+    assert [r.box for r in kept] == [[0, 0, MIN_DIM, 400]]
+
+
+def test_clamp_box_rounds_half_values():
+    # 0.5-unit pixel coordinates round to the nearest int (banker's rounding).
+    assert _clamp_box([0.5, 0.5, 10.5, 10.5], 100, 100) == [5, 5, 105, 105]
+
+
+def test_crop_data_uri_exact_pixels(tmp_path):
+    from PIL import Image
+
+    image = Image.new("RGB", (1000, 1000), (255, 255, 255))
+    # Red quadrant at the top-left.
+    for x in range(0, 500):
+        for y in range(0, 500):
+            image.putpixel((x, y), (255, 0, 0))
+    path = tmp_path / "quadrants.png"
+    image.save(path)
+
+    import base64
+    import io
+
+    uri = crop_data_uri(path, [0, 0, 500, 500])
+    assert uri is not None
+    crop = Image.open(io.BytesIO(base64.b64decode(uri.split(",", 1)[1])))
+    assert crop.size == (500, 500)
+    assert crop.getpixel((250, 250)) == (255, 0, 0)
+
+    # Clamped to the image bounds.
+    uri = crop_data_uri(path, [-100, -100, 100, 100])
+    assert uri is not None
+    crop = Image.open(io.BytesIO(base64.b64decode(uri.split(",", 1)[1])))
+    assert crop.size == (100, 100)
+    assert crop.getpixel((50, 50)) == (255, 0, 0)
+
+
+def test_spans_to_jsonl_exact_format():
+    spans = [
+        Span(page=1, label="text", box=None, text="a", id="p1-1"),
+        Span(page=2, label="text", box=None, text="b", id="p2-1"),
+    ]
+    # Key order follows the dataclass fields; image is omitted when None.
+    assert spans_to_jsonl(spans) == (
+        '{"page": 1, "label": "text", "box": null, "text": "a", "id": "p1-1"}\n'
+        '{"page": 2, "label": "text", "box": null, "text": "b", "id": "p2-1"}'
+    )

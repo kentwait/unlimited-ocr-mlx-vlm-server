@@ -181,3 +181,21 @@ def test_job_surfaces_unexpected_errors(client, monkeypatch):
 
 def test_job_unknown_id(client):
     assert client.get("/parse/jobs/deadbeef").status_code == 404
+
+def test_upload_exact_size_limit_passes(client, monkeypatch):
+    from ocr_server import api as api_mod
+
+    payload = make_text_pdf(1)
+    monkeypatch.setattr(api_mod, "MAX_UPLOAD_BYTES", len(payload))
+    response = _post_pdf(client, payload, pages="1")
+    assert response.status_code == 200, response.text
+
+
+def test_upload_accepts_octet_stream_pdf_name(client):
+    payload = make_text_pdf(1)
+    response = client.post(
+        "/parse/pdf",
+        files={"file": ("t.pdf", payload, "application/octet-stream")},
+        data={"pages": "1"},
+    )
+    assert response.status_code == 200, response.text

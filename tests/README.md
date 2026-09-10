@@ -38,35 +38,38 @@ splits on NEL/Unicode boundaries found in extracted text).
 `make mutate` (`mutmut run`) — never CI. Config in `pyproject.toml`
 (`[tool.mutmut]`): log-call lines are excluded (no test asserts log text).
 
-**Do not trust parallel verdicts.** `--max-children N` runs misreport
-survivors: a large share of parallel "survivors" die on isolated serial
-re-runs (e.g. `max(None, b[0])`-class mutants inside `_iou` that every
-covering test kills). Parallel runs are useful as a triage queue only; the
-backstop oracle is serial re-run by name (`mutmut run <name...>`).
-
-Baseline 2026-09-10 (digital-only rewrite), parallel full run: **918 killed
-/ 265 survived / 1183** (~78% kill). Serial re-verification of the 265
-survivors was run after the suite was hardened with exact-value pins (crop
-pixels, IoU arithmetic, threshold boundaries, CLI/env wiring, upload-size
-boundary); during that pass the serial verdicts flipped a large fraction of
-the parallel survivors to killed, confirming the caveat above. A complete
-serial baseline remains a follow-up.
+Baseline 2026-09-10 (digital-only rewrite): **1183 mutants**. A parallel
+full run (stable across two repeats) reported **918 killed / 265 survived**.
+Every parallel survivor was then re-verified **serially**
+(`mutmut run --max-children 1 <name...>`) with this hardened suite:
+**252 confirmed survived, 13 killed** — i.e. parallel survivor verdicts held
+~95% of the time. The flake is real but rare; serial re-run by name remains
+the oracle, and recorded baselines come from serial runs. Harness note:
+`mutmut run` defaults to parallel even without `--max-children`; pass
+`--max-children 1` for a true serial pass.
 
 Survivor classes to expect (triaged, not chased to zero):
 
-- `__main__.main` (~43): logging/argparse/uvicorn plumbing strings and
+- `__main__.main` (43): logging/argparse/uvicorn plumbing strings and
   defaults; only the env wiring is asserted.
-- math helpers (`_iou`, `_center_inside`, `_clamp_box`, ~45): equivalent
+- `pipeline.parse_pdf` (30): warning/log string arguments, message wording,
+  and defensive branches around the happy path.
+- math helpers (`pp_layout._iou`, `_center_inside`, `_clamp_box`,
+  `pipeline._iou`/`_center_inside`/`_picture_matches`; ~54): equivalent
   mutants (comparison/min/max swaps that preserve outcomes on all asserted
   inputs) and unreachable guards.
-- `figures.crop_data_uri` (~20): coordinate rounding/clamping arithmetic
+- `figures.crop_data_uri` (23): coordinate rounding/clamping arithmetic
   beyond the exact-pixel pins.
-- `api._save_upload` (~18): status-message cosmetics and content-type
+- `native_layout.extract_boxes` (21) and `normalize_box` (6): missing-key
+  fallbacks and clamping branches.
+- `api._save_upload` (18): status-message cosmetics and content-type
   fallbacks.
-- `merge_page`/misc (~15): warning/log strings and defensive branches.
+- `pp_layout.clean_regions` (16), `pages.parse_pages_spec` (12): equivalent
+  predicate swaps on the tested input space.
+- `LayoutModel.load/detect`, `merge_page`, `spans_to_jsonl`,
+  `render_pdf_pages` (~20): idempotence/equivalence and log arguments.
 
 Triage policy: sample survivors per file, close cheap assertion gaps
 (observable behavior only), record the new baseline here, and document
 equivalent/noise classes. Re-run from a clean cache after changing tests
-(`rm -rf .mutmut-cache mutants`), and re-run suspect mutants by name before
-recording verdicts.
+(`rm -rf .mutmut-cache mutants`).

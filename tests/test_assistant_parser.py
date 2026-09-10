@@ -285,3 +285,282 @@ def test_filter_abandons_oversized_tool_block():
 def test_content_text_handles_other_types():
     messages = [{"role": "user", "content": None}]
     assert to_chat_messages(messages) == [{"role": "user", "content": ""}]
+
+
+# ---------- mutation triage: helpers and stream-filter boundaries ----------
+
+from ocr_server.assistant_parser import (  # noqa: E402
+    _content_text,
+    _normalize_tool_calls,
+    _partial_suffix_hold,
+    _space_hold,
+    _strip_wrapping_newlines,
+    clean_parameter_value,
+)
+
+
+def test_strip_wrapping_newlines_exact():
+    assert _strip_wrapping_newlines("\nx\n") == "x"
+    assert _strip_wrapping_newlines("\nx") == "x"
+    assert _strip_wrapping_newlines("x\n") == "x"
+    assert _strip_wrapping_newlines("x") == "x"
+    assert _strip_wrapping_newlines("\n") == ""
+    assert _strip_wrapping_newlines("\n\n") == ""
+
+
+def test_space_hold_exact():
+    assert _space_hold("") == 0
+    assert _space_hold("abc") == 0
+    assert _space_hold("abc ") == 1
+    assert _space_hold("a  ") == 2
+    assert _space_hold("abc      ") == 4
+    assert _space_hold("abc   ", limit=2) == 2
+
+
+def test_partial_suffix_hold_exact():
+    assert _partial_suffix_hold("") == 0
+    assert _partial_suffix_hold("abc") == 0
+    assert _partial_suffix_hold("<") == 1
+    assert _partial_suffix_hold("</thin") == len("</thin")
+    assert _partial_suffix_hold("x<tool_call") == len("<tool_call")
+    assert _partial_suffix_hold("</think>") == 0
+
+
+def test_clean_parameter_value_exact():
+    assert clean_parameter_value("plain") == "plain"
+    assert clean_parameter_value("\nplain\n") == "plain"
+    assert clean_parameter_value("<parameter=query>café") == "café"
+    assert clean_parameter_value("satellite<parameter=query>inner") == "inner"
+    assert (
+        clean_parameter_value("satellite<tool_call><function=x>inner")
+        == "satelliteinner"
+    )
+
+
+def test_normalize_tool_calls_processes_all_and_shapes():
+    calls = _normalize_tool_calls(
+        [
+            "not-a-call",
+            {"function": None},
+            {"function": {"name": "", "arguments": "{}"}},
+            {"function": {"name": "a", "arguments": {"x": 1}}},
+            {"function": {"name": "b", "arguments": "{bad"}},
+            {"function": {"name": "c", "arguments": '{"y": "2"}'}},
+        ]
+    )
+    assert [call["function"]["name"] for call in calls] == ["a", "b", "c"]
+    for call in calls:
+        assert call == {
+            "type": "function",
+            "function": {
+                "name": call["function"]["name"],
+                "arguments": call["function"]["arguments"],
+            },
+        }
+    assert calls[0]["function"]["arguments"] == {"x": 1}
+    assert calls[1]["function"]["arguments"] == {}
+    assert calls[2]["function"]["arguments"] == {"y": "2"}
+
+
+def test_content_text_joins_with_single_newline():
+    assert _content_text([{"text": "a"}, {"text": "b"}]) == "a\nb"
+    assert _content_text([{"other": 1}, "x", None]) == ""
+
+
+def test_to_chat_messages_preserves_assistant_content():
+    converted = to_chat_messages(
+        [
+            {"role": "assistant", "content": "calling now"},
+            {"content": "no role at all"},
+        ]
+    )
+    assert converted == [{"role": "assistant", "content": "calling now"}]
+
+
+def test_parse_tool_calls_keeps_unicode_verbatim():
+    block = "<function=search>\n<parameter=query>\ncafé\n</parameter>\n</function>"
+    call = parse_tool_calls([block])[0]
+    assert "café" in call["function"]["arguments"]
+
+
+def test_filter_initial_state_flags():
+    flt = QwenStreamFilter()
+    assert flt._swallow_newlines is False
+    tail, blocks = flt.finish()
+    assert (tail, blocks) == ("", [])
+
+
+def test_filter_swallows_leading_spaces_before_stray_closer():
+    flt = QwenStreamFilter()
+    emitted = flt.feed("alpha   </parameter>")
+    assert emitted == "alpha"
+
+
+def test_filter_stops_swallowing_after_real_text():
+    flt = QwenStreamFilter()
+    emitted = flt.feed("</tool_call>")
+    emitted += flt.feed("\n\nXtail")
+    assert emitted == "Xtail"
+
+
+def test_filter_keeps_runs_longer_than_hold_limit():
+    flt = QwenStreamFilter()
+    assert flt.feed("abc      ") == "abc  "
+    tail, _blocks = flt.finish()
+    assert tail == "    "
+
+
+def test_filter_picks_the_earliest_tag_not_the_last():
+    flt = QwenStreamFilter()
+    emitted = flt.feed("hello <parameter=a>1<parameter=b>2")
+    assert emitted == "hello "
+    tail, _blocks = flt.finish()
+    assert tail == ""
+
+
+def test_filter_captures_each_function_separately():
+    flt = QwenStreamFilter()
+    emitted = flt.feed(
+        "<tool_call><function=a></function></tool_call>"
+        "<tool_call><function=b></function></tool_call>"
+    )
+    tail, blocks = flt.finish()
+    assert emitted == "" and tail == ""
+    assert len(blocks) == 2
+    assert [parse_tool_calls(blocks)[0]["function"]["name"], parse_tool_calls(blocks)[1]["function"]["name"]] == ["a", "b"]
+
+
+def test_filter_drops_second_think_block_too():
+    flt = QwenStreamFilter()
+    emitted = flt.feed("<think>one</think>a<think>two</think>b")
+    assert emitted == "ab"
+
+
+def test_filter_tool_buffer_boundary_is_strict():
+    from ocr_server.assistant_parser import MAX_TOOL_BUFFER
+
+    flt = QwenStreamFilter()
+    flt.feed("<tool_call>" + "x" * (MAX_TOOL_BUFFER - len("<tool_call>")))
+    assert flt.mode == "tool"
+    emitted = flt.feed("more")
+    assert flt.mode == "text"
+    assert emitted == ""
+
+
+def test_filter_finish_text_tail_prefers_buffer_over_flag():
+    flt = QwenStreamFilter()
+    flt.feed("<tool_call><function=a></function>")
+    emitted = flt.feed("</tool_call>")  # sets swallow flag
+    emitted += flt.feed("\nX")
+    tail, _blocks = flt.finish()
+    assert emitted + tail == "X"
+
+
+def test_filter_finish_tool_block_without_function_is_dropped():
+    flt = QwenStreamFilter()
+    flt.feed("<tool_call>")
+    tail, blocks = flt.finish()
+    assert tail == "" and blocks == []
+
+
+def test_filter_exact_output_matrix():
+    cases = [
+        ("plain text", "plain text", []),
+        ("a<think>x</think>b", "ab", []),
+        ("a</parameter>b", "ab", []),
+        ("a</function>b", "ab", []),
+        ("a</tool_call>b", "ab", []),
+        ("a</think>b", "ab", []),
+        (
+            "<tool_call><function=s><parameter=q>v</parameter></function>"
+            "</tool_call>",
+            "",
+            ["s"],
+        ),
+        ("x<function=s><parameter=q>v</parameter></function>y", "xy", ["s"]),
+        # Premature close with no function close: unparseable, dropped.
+        (
+            "<tool_call><function=s><parameter=q>v</tool_call>w",
+            "",
+            [],
+        ),
+    ]
+    for raw, expected_display, expected_tools in cases:
+        flt = QwenStreamFilter()
+        displayed = flt.feed(raw)
+        tail, blocks = flt.finish()
+        displayed += tail
+        assert displayed == expected_display, raw
+        assert [
+            call["function"]["name"] for call in parse_tool_calls(blocks)
+        ] == expected_tools, raw
+        # Chunk-invariance: every two-way split must agree exactly.
+        for split in range(len(raw) + 1):
+            split_flt = QwenStreamFilter()
+            split_text = split_flt.feed(raw[:split]) + split_flt.feed(raw[split:])
+            split_tail, split_blocks = split_flt.finish()
+            split_text += split_tail
+            assert split_text == expected_display, (raw, split)
+            assert [
+                call["function"]["name"]
+                for call in parse_tool_calls(split_blocks)
+            ] == expected_tools, (raw, split)
+
+
+def test_filter_swallow_flag_survives_until_real_text():
+    flt = QwenStreamFilter()
+    flt.feed("</tool_call>")
+    assert flt.feed("X") == "X"
+    assert flt.feed("\n\ntail") == "\n\ntail"
+
+
+def test_filter_swallow_strips_newline_but_not_other_letters():
+    flt = QwenStreamFilter()
+    flt.feed("</tool_call>")
+    assert flt.feed("\nX") == "X"
+
+
+def test_filter_swallows_all_leading_spaces_before_closer():
+    flt = QwenStreamFilter()
+    assert flt.feed("  </parameter>") == ""
+    assert flt.feed("a   </parameter>") == "a"
+
+
+def test_filter_finish_lstrip_branch_is_total_on_empty_buffer():
+    flt = QwenStreamFilter()
+    flt.feed("</tool_call>")
+    tail, blocks = flt.finish()
+    assert (tail, blocks) == ("", [])
+
+
+def test_finish_tool_state_conditions_whitebox():
+    flt = QwenStreamFilter()
+    flt._mode = "tool"
+    flt._buffer = "<function=x>"
+    tail, blocks = flt.finish()
+    assert tail == ""
+    assert blocks == ["<function=x>"]
+    assert flt._buffer == ""
+    assert flt._mode == "text"
+    assert flt._swallow_newlines is False
+
+    other = QwenStreamFilter()
+    other._mode = "tool"
+    other._buffer = "no function here"
+    tail2, blocks2 = other.finish()
+    assert tail2 == "" and blocks2 == []
+
+    plain = QwenStreamFilter()
+    plain._buffer = "visible"
+    tail3, blocks3 = plain.finish()
+    assert tail3 == "visible" and blocks3 == []
+
+
+def test_finish_swallow_branch_whitebox():
+    flt = QwenStreamFilter()
+    flt._swallow_newlines = True
+    flt._buffer = " X"
+    tail, blocks = flt.finish()
+    assert tail == " X"
+    assert blocks == []
+    assert flt._swallow_newlines is False

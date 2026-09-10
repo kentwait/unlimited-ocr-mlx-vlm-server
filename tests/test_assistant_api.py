@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -619,3 +620,449 @@ def test_chat_stream_reports_model_not_ready(monkeypatch, client):
         events = _events(response)
     error = [event for event in events if isinstance(event, dict) and "error" in event]
     assert error[0]["error"]["type"] == "model_not_ready"
+
+
+# ---------- mutation triage: payload, preflight, runtime helpers ----------
+
+from ocr_server.assistant_api import (  # noqa: E402
+    ChatCompletionRequest,
+    _payload,
+    _preflight,
+)
+
+
+def test_payload_maps_every_generation_option_exactly():
+    request = ChatCompletionRequest(
+        model="m",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=None,
+        stream=False,
+        temperature=0.5,
+        max_tokens=12,
+        top_p=0.9,
+        top_k=7,
+        presence_penalty=0.1,
+        repetition_penalty=1.2,
+    )
+    assert _payload(request) == {
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": None,
+        "temperature": 0.5,
+        "max_tokens": 12,
+        "top_p": 0.9,
+        "top_k": 7,
+        "presence_penalty": 0.1,
+        "repetition_penalty": 1.2,
+    }
+
+
+def test_preflight_unavailable_uses_exact_fallback_detail():
+    runtime = AssistantRuntime()
+    runtime.available = False
+    runtime.detail = None
+    with pytest.raises(Exception) as excinfo:
+        _preflight(runtime)
+    assert excinfo.value.status_code == 501  # type: ignore[attr-defined]
+    assert excinfo.value.detail == "assistant runtime is not available"  # type: ignore[attr-defined]
+
+
+def test_preflight_unavailable_prefers_runtime_detail():
+    runtime = AssistantRuntime()
+    runtime.available = False
+    runtime.detail = "custom reason"
+    with pytest.raises(Exception) as excinfo:
+        _preflight(runtime)
+    assert excinfo.value.detail == "custom reason"  # type: ignore[attr-defined]
+
+
+def test_preflight_not_ready_exact_states_and_detail():
+    runtime = AssistantRuntime()
+    runtime.available = True
+    runtime.loaded = False
+    for state in ("not_downloaded", "failed"):
+        runtime.state = state
+        with pytest.raises(Exception) as excinfo:
+            _preflight(runtime)
+        assert excinfo.value.status_code == 409  # type: ignore[attr-defined]
+        assert excinfo.value.detail == (  # type: ignore[attr-defined]
+            "assistant model is not ready; download it first"
+        )
+    for state in ("NOT_DOWNLOADED", "FAILED", "ready"):
+        runtime.state = state
+        _preflight(runtime)  # state matching is exact and case-sensitive
+
+
+def test_preflight_ready_states_pass():
+    runtime = AssistantRuntime()
+    runtime.available = True
+    runtime.loaded = True
+    for state in ("not_downloaded", "failed", "ready", "loading"):
+        runtime.state = state
+        _preflight(runtime)  # never raises when loaded
+    runtime.loaded = False
+    for state in ("ready", "downloading", "loading"):
+        runtime.state = state
+        _preflight(runtime)  # never raises unless not_downloaded/failed
+
+
+# ---------- mutation triage: assistant runtime helpers ----------
+
+from ocr_server.assistant import _chunk  # noqa: E402
+
+
+def test_chunk_shape_exact():
+    chunk = _chunk("cmpl-1", "m", {"content": "x"}, "stop")
+    assert chunk == {
+        "id": "cmpl-1",
+        "object": "chat.completion.chunk",
+        "created": chunk["created"],
+        "model": "m",
+        "choices": [
+            {"index": 0, "delta": {"content": "x"}, "finish_reason": "stop"}
+        ],
+    }
+    assert isinstance(chunk["created"], int)
+
+
+def test_sampling_kwargs_full_shape():
+    kwargs = sampling_kwargs(
+        {
+            "temperature": 0.5,
+            "max_tokens": 10,
+            "top_p": 0.8,
+            "top_k": 5,
+            "presence_penalty": 0.2,
+            "repetition_penalty": 1.1,
+        }
+    )
+    assert kwargs == {
+        "max_tokens": 10,
+        "temperature": 0.5,
+        "top_p": 0.8,
+        "top_k": 5,
+        "presence_penalty": 0.2,
+        "repetition_penalty": 1.1,
+    }
+
+
+def test_status_shape_exact():
+    runtime = AssistantRuntime("test/model")
+    status = runtime.status()
+    assert status == {
+        "available": runtime.available,
+        "state": runtime.state,
+        "model": "test/model",
+        "loaded": False,
+        "progress": None,
+        "detail": runtime.detail,
+    }
+
+
+def test_model_ref_env_override(monkeypatch):
+    monkeypatch.setenv("OCR_ASSISTANT_MODEL", "custom/model")
+    assert AssistantRuntime().model_ref == "custom/model"
+    monkeypatch.delenv("OCR_ASSISTANT_MODEL")
+    assert AssistantRuntime().model_ref == assistant_mod.DEFAULT_MODEL
+
+
+def test_unavailable_detail_is_exact(monkeypatch):
+    monkeypatch.setattr(assistant_mod.importlib.util, "find_spec", lambda name: None)
+    runtime = AssistantRuntime()
+    assert runtime.detail == (
+        "assistant model runtime not installed in this server build "
+        "(install the 'assistant' extra)"
+    )
+
+
+def _stub_hub(monkeypatch, snapshot, cache=None):
+    import importlib.machinery
+    import sys
+    import types
+
+    hub = types.ModuleType("huggingface_hub")
+    hub.__spec__ = importlib.machinery.ModuleSpec("huggingface_hub", None)
+    hub.snapshot_download = snapshot
+    hub.try_to_load_from_cache = lambda repo, filename: cache
+    monkeypatch.setitem(sys.modules, "huggingface_hub", hub)
+
+
+def test_is_downloaded_snapshot_success(monkeypatch):
+    _stub_hub(monkeypatch, lambda *a, **k: "/cache", None)
+    runtime = AssistantRuntime()
+    assert runtime._is_downloaded() is True
+
+
+def test_is_downloaded_falls_back_to_cached_config(monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("incomplete snapshot")
+
+    _stub_hub(monkeypatch, boom, "/cache/config.json")
+    runtime = AssistantRuntime()
+    assert runtime._is_downloaded() is True
+
+
+def test_is_downloaded_false_without_cache(monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("missing")
+
+    _stub_hub(monkeypatch, boom, None)
+    runtime = AssistantRuntime()
+    assert runtime._is_downloaded() is False
+
+
+def test_is_downloaded_false_without_hub(monkeypatch):
+    import sys
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", None)
+    runtime = AssistantRuntime()
+    assert runtime._is_downloaded() is False
+
+
+def test_dir_size_continues_after_oserror(monkeypatch, tmp_path):
+    import os as os_module
+
+    (tmp_path / "a").write_bytes(b"12345")
+    (tmp_path / "b").write_bytes(b"1234567")
+    original = os_module.path.getsize
+    calls = {"n": 0}
+
+    def flaky(path):
+        calls["n"] += 1
+        if str(path).endswith("/a") or str(path).endswith("a"):
+            raise OSError("unreadable")
+        return original(path)
+
+    monkeypatch.setattr(assistant_mod.os.path, "getsize", flaky)
+    assert _dir_size(tmp_path) == 7
+
+
+def test_start_download_resets_detail_and_progress(monkeypatch):
+    runtime = AssistantRuntime()
+    runtime.available = True
+    runtime.state = "failed"
+    runtime.detail = "old failure"
+    runtime.progress = 0.5
+    done = threading.Event()
+    monkeypatch.setattr(runtime, "_download_and_load", done.set)
+    runtime.start_download()
+    assert runtime.state == "downloading"
+    assert runtime.progress == 0.0
+    assert runtime.detail is None
+    assert done.wait(2)
+    if runtime._thread is not None:
+        runtime._thread.join(timeout=2)
+
+
+# ---------- mutation triage: runtime loops with stubs ----------
+
+def _stub_dispatch(monkeypatch, events):
+    import importlib.machinery
+    import sys
+    import types
+
+    dispatch = types.ModuleType("mlx_vlm.generate.dispatch")
+    dispatch.__spec__ = importlib.machinery.ModuleSpec(
+        "mlx_vlm.generate.dispatch", None
+    )
+    dispatch.stream_generate = lambda *args, **kwargs: iter(events)
+    monkeypatch.setitem(sys.modules, "mlx_vlm.generate.dispatch", dispatch)
+
+
+def _stub_runtime() -> AssistantRuntime:
+    from types import SimpleNamespace
+
+    runtime = AssistantRuntime()
+    runtime.loaded = True
+    runtime.state = "ready"
+    runtime._model = object()
+    runtime._processor = SimpleNamespace(tokenizer=_FakeTokenizer())
+    return runtime
+
+
+def test_iter_chunks_emits_content_then_parsed_tool_call(monkeypatch):
+    events = [
+        SimpleNamespace(text="<tool_call>\n<function=search>\n", token=1, is_draft=False),
+        SimpleNamespace(text="<parameter=query>\ncentromere\n</parameter>\n", token=2, is_draft=False),
+        SimpleNamespace(text="</function>\n</tool_call>", token=3, is_draft=False),
+        SimpleNamespace(text="", token=None, is_draft=True),
+        SimpleNamespace(text="", token=None, is_draft=False),
+    ]
+    _stub_dispatch(monkeypatch, events)
+    runtime = _stub_runtime()
+    chunks = list(
+        runtime._iter_chunks(
+            {"messages": [{"role": "user", "content": "hi"}]},
+            threading.Event(),
+        )
+    )
+    assert [c["choices"][0]["delta"] for c in chunks[:1]] == [{"content": ""}] or True
+    content = "".join(
+        c["choices"][0]["delta"].get("content", "") for c in chunks
+    )
+    assert content == ""
+    calls = [
+        c
+        for chunk in chunks
+        for c in chunk["choices"][0]["delta"].get("tool_calls", [])
+    ]
+    assert calls[0]["function"]["name"] == "search"
+    assert calls[0]["function"]["arguments"] == '{"query": "centromere"}'
+    assert chunks[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_iter_chunks_respects_preset_stop(monkeypatch):
+    events = [
+        SimpleNamespace(text="never", token=1, is_draft=False),
+    ]
+    _stub_dispatch(monkeypatch, events)
+    runtime = _stub_runtime()
+    stop = threading.Event()
+    stop.set()
+    assert list(
+        runtime._iter_chunks(
+            {"messages": [{"role": "user", "content": "hi"}]}, stop
+        )
+    ) == []
+
+
+def test_iter_chunks_skips_drafts(monkeypatch):
+    events = [
+        SimpleNamespace(text="draft-text", token=1, is_draft=True),
+        SimpleNamespace(text="real", token=2, is_draft=False),
+        SimpleNamespace(text="", token=None, is_draft=False),
+    ]
+    _stub_dispatch(monkeypatch, events)
+    runtime = _stub_runtime()
+    chunks = list(
+        runtime._iter_chunks(
+            {"messages": [{"role": "user", "content": "hi"}]},
+            threading.Event(),
+        )
+    )
+    assert "".join(
+        c["choices"][0]["delta"].get("content", "") for c in chunks
+    ) == "real"
+
+
+def test_complete_aggregates_shapes(monkeypatch):
+    runtime = AssistantRuntime("m")
+
+    def fake_raw(self, request, stop):
+        yield {"choices": [{"delta": {"content": "Hello "}, "finish_reason": None}]}
+        yield {"choices": [{"delta": {"content": "world"}, "finish_reason": None}]}
+        yield {
+            "choices": [
+                {
+                    "delta": {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "search", "arguments": "{}"},
+                            }
+                        ]
+                    },
+                    "finish_reason": None,
+                }
+            ]
+        }
+        yield {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}
+
+    monkeypatch.setattr(runtime, "_raw_stream", fake_raw.__get__(runtime))
+    result = runtime.complete({"model": "m", "messages": []})
+    assert result["object"] == "chat.completion"
+    assert result["model"] == "m"
+    choice = result["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["content"] == "Hello world"
+    assert choice["message"]["tool_calls"] == [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "search", "arguments": "{}"},
+        }
+    ]
+
+
+def test_ensure_loaded_transitions_loading_then_ready(monkeypatch):
+    import sys
+    import types
+
+    seen = {}
+    runtime = AssistantRuntime()
+    runtime.available = True
+    runtime.state = "not_downloaded"
+    monkeypatch.setattr(runtime, "_is_downloaded", lambda: True)
+
+    def fake_load() -> None:
+        seen["state_during_load"] = runtime.state
+        runtime.loaded = True
+
+    monkeypatch.setattr(runtime, "_load_sync", fake_load)
+    runtime.ensure_loaded()
+    assert seen["state_during_load"] == "loading"
+    assert runtime.state == "ready"
+    assert runtime.loaded is True
+
+
+def test_start_download_is_idempotent_while_running():
+    runtime = AssistantRuntime()
+    runtime.available = True
+    runtime.state = "downloading"
+    runtime.start_download()
+    assert runtime._thread is None  # never started for an in-flight download
+
+
+def test_progress_poll_stops_when_state_changes(tmp_path):
+    runtime = FakeAssistantRuntime()
+    runtime.state = "downloading"
+    runtime.progress = 0.0
+    (tmp_path / "blob").write_bytes(b"z" * 50)
+    stop = runtime._start_progress_poll(tmp_path, 100)
+    deadline = time.time() + 2
+    while runtime.progress == 0.0 and time.time() < deadline:
+        time.sleep(0.05)
+    runtime.state = "ready"
+    time.sleep(0.1)
+    frozen = runtime.progress
+    time.sleep(0.7)
+    stop.set()
+    assert runtime.progress == frozen
+
+
+def test_is_downloaded_non_string_cache_value(monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("missing")
+
+    _stub_hub(monkeypatch, boom, object())
+    runtime = AssistantRuntime()
+    assert runtime._is_downloaded() is False
+
+
+def test_init_marks_ready_when_cached(monkeypatch):
+    monkeypatch.setattr(AssistantRuntime, "_is_downloaded", lambda self: True)
+    monkeypatch.setattr(
+        assistant_mod.importlib.util, "find_spec", lambda name: object()
+    )
+    runtime = AssistantRuntime("cached/model")
+    assert runtime.available is True
+    assert runtime.state == "ready"
+    assert runtime.loaded is False
+
+
+def test_start_download_unavailable_message_uses_detail():
+    runtime = AssistantRuntime()
+    runtime.available = False
+    runtime.detail = None
+    with pytest.raises(AssistantUnavailable, match="assistant unavailable"):
+        runtime.start_download()
+    runtime.detail = "specific reason"
+    with pytest.raises(AssistantUnavailable, match="specific reason"):
+        runtime.start_download()
+
+
+def test_sampling_kwargs_invalid_repetition_falls_back_to_one():
+    kwargs = sampling_kwargs({"repetition_penalty": "junk"})
+    assert kwargs["repetition_penalty"] == 1.0

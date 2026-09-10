@@ -18,6 +18,14 @@ dependencies = [
     "onnxruntime>=1.18.0",
 ]
 
+[project.optional-dependencies]
+# Local assistant runtime (Apple Silicon): loading the model is optional so
+# the parser stays cross-platform and CI stays weight-free.
+assistant = [
+    "mlx-vlm>=0.6.0",
+    "huggingface-hub>=0.30.0",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=8.0.0",

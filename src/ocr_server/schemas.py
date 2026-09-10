@@ -45,3 +45,14 @@ class JobStatus(BaseModel):
     phase: str | None = None  # "parse"
     pages_done: int = 0
     pages_total: int | None = None
+
+
+class AssistantStatus(BaseModel):
+    """Local assistant model lifecycle, polled by the chat panel."""
+
+    available: bool  # the optional model runtime is installed in this build
+    state: str  # not_downloaded | downloading | loading | ready | failed
+    model: str  # pinned model reference
+    loaded: bool = False  # weights resident in memory
+    progress: float | None = None  # 0..1 while downloading
+    detail: str | None = None  # failure explanation

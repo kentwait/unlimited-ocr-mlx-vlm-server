@@ -18,6 +18,14 @@ the 4.7 MB PP-DocLayout-S ONNX export is vendored under
 `src/ocr_server/models/` (SHA pinned by `test_pp.py`). The suite runs on any
 platform, including CI.
 
+## Assistant tests
+
+`test_assistant_parser.py` (XML tool-call extraction, streaming filter,
+message conversion, Hypothesis properties) and `test_assistant_api.py`
+(fake runtime lifecycle, guards, SSE shapes, cancellation) run without MLX;
+weight-dependent paths carry `# pragma: no cover`. The `OCR_ASSISTANT_FAKE=1`
+runtime is also what `scripts/contract-check.mjs` uses in the app repo.
+
 ## Coverage
 
 `make coverage` enforces **95%** (`--cov-fail-under=95`; currently 100%).
@@ -72,4 +80,27 @@ Survivor classes to expect (triaged, not chased to zero):
 Triage policy: sample survivors per file, close cheap assertion gaps
 (observable behavior only), record the new baseline here, and document
 equivalent/noise classes. Re-run from a clean cache after changing tests
-(`rm -rf .mutmut-cache mutants`).
+(`rm -rf .mutmut-cache mutants`), and re-run suspect mutants by name before
+recording verdicts.
+
+Assistant triage (2026-09-10, after the runtime-hardening pass):
+full-suite run = **1792 killed / 512 survived / 43 no tests / 13 timeouts**
+of 2366 mutants. The assistant modules account for 220 survivors:
+
+- `assistant_api.py`: 0 survivors (payload/preflight/SSE guards all pinned).
+- `assistant_parser.py`: 12 survivors, every one proven equivalent by direct
+  application (`ensure_ascii=None` behaves as False; `range(len(tag))` adds
+  only size 0; a `None` swallow flag is falsy like False; `str[None:]` is the
+  whole string; an index-0 tool tag is unreachable; missing-role defaults all
+  drop the message; `or` vs `and` on empty tool calls is a no-op).
+- `assistant.py`: 207 survivors, dominated by weight-gated paths
+  (`AssistantRuntime._iter_chunks`, `complete`, `stream`, download/load) and
+  internal state transitions that are only observable through MLX generation.
+  These are covered behaviorally by the real-weight acceptance run against
+  `mlx-community/Qwen3.5-9B-MLX-8bit` (multi-step cited answer plus refusal
+  on `altemose2022.pdf`), not by CI.
+
+Helper/API/parser gaps closed by this pass live in the assistant test files:
+chunk shapes, sampling defaults and overrides, preflight status codes and
+detail strings, download progress polling, buffered-token regression, and a
+full stream-filter matrix asserted at every two-way chunk split.

@@ -408,36 +408,30 @@ async def _parse_pdf_path(
     support = _get_support_engine()
     engine = holder.get_ocr_engine(ocr_model)
 
-    # Layout pre-scan: one cheap vision call per page on downscaled
-    # thumbnails, fanned out concurrently. Inference itself serializes on
-    # infer_limiter (one MLX user); the gather overlaps thumbnail CPU work
-    # and avoids extra request round-trips. Any per-page failure yields
-    # None and that page runs unhinted. Reported inside phase "ocr".
+    # Per-page scan-then-OCR: the support model pre-scans a downscaled
+    # thumbnail (cheap vision call) and the OCR prompt carries the resulting
+    # one-sentence hint for that same page. Interleaved (not batched) so
+    # job.pages_done advances steadily — a batch-first scan would park the
+    # progress ring at 0 through N serialized support calls. Inference
+    # serializes on infer_limiter either way; thumbnailing is CPU-only.
+    # Any per-page scan failure yields None and that page runs unhinted.
     # Furniture pass needs the whole document's OCR first (cross-page
-    # fingerprints), so run OCR for all pages, then process.
+    # fingerprints), so generic furniture + support correction run after
+    # the OCR loop.
     page_ocr: list[tuple[int, Path, str, object, float]] = []
+    layouts: list[LayoutProfile | None] = []
     total0 = time.perf_counter()
     try:
-        if support is not None:
-            thumbs = [await anyio.to_thread.run_sync(_thumbnail_for_scan, p) for p in rendered]
-            if job is not None:
-                job.phase = "ocr"
-            layouts: list[LayoutProfile | None] = list(
-                await asyncio.gather(
-                    *(
-                        _run_layout_scan(support, thumb, n)
-                        for thumb, n in zip(thumbs, page_nums)
-                    )
-                )
-            )
-        elif holder.is_fake:
-            layouts = [_fake_layout(n) for n in page_nums]
-        else:
-            layouts = [None for _ in page_nums]
-        hints = [layout_hint(layout) for layout in layouts]
-
-        for (page_num, img_path), hint in zip(zip(page_nums, rendered), hints):
-            page_params = _ocr_params_with_hint(params, hint)
+        for page_num, img_path in zip(page_nums, rendered):
+            if support is not None:
+                thumb = await anyio.to_thread.run_sync(_thumbnail_for_scan, img_path)
+                layout = await _run_layout_scan(support, thumb, page_num)
+            elif holder.is_fake:
+                layout = _fake_layout(page_num)
+            else:
+                layout = None
+            layouts.append(layout)
+            page_params = _ocr_params_with_hint(params, layout_hint(layout))
             text, stats, elapsed = await _infer_image_path(img_path, page_params, engine)
             page_ocr.append((page_num, img_path, text, stats, elapsed))
             if job is not None:

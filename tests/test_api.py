@@ -54,7 +54,10 @@ def test_root_lists_endpoints(client):
         "/parse/pdf",
         "/parse/jobs",
         "/assistant/status",
+        "/assistant/models",
         "/assistant/model/download",
+        "/assistant/model/use",
+        "/assistant/model/cancel",
         "/v1/chat/completions",
     }
 

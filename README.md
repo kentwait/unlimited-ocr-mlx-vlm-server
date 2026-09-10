@@ -85,20 +85,38 @@ and Apple-Silicon-only; parsing works without it.
 
 ```bash
 uv sync --extra assistant                                        # mlx-vlm + huggingface-hub
+HF_TOKEN=hf_... uv run ocr-server                                # optional Hub auth
 uv run ocr-server                                                # hosts /assistant/* and /v1/chat/completions
 OCR_ASSISTANT_FAKE=1 uv run ocr-server                           # deterministic fake (CI, UI dev)
-uv run ocr-server --assistant-model mlx-community/Qwen3.5-9B-MLX-8bit
+uv run ocr-server --assistant-model mlx-community/Qwen3.5-9B-MLX-4bit
 ```
 
-- `GET /assistant/status` — `{available, state, model, loaded, progress, detail}`
-  with state `not_downloaded | downloading | loading | ready | failed`.
-- `POST /assistant/model/download` — explicit, idempotent download (~9.7 GB,
-  Hugging Face cache) followed by load.
+Models come from a data-driven catalog of pinned Qwen3.5-9B MLX
+quantizations (`mlx-community/Qwen3.5-9B-MLX-8bit` default,
+`mlx-community/Qwen3.5-9B-MLX-4bit`). Each entry tracks its own cache state;
+one is loaded at a time.
+
+- `GET /assistant/status` — `{available, state, model, loaded, progress,
+  detail, models}` with state `not_downloaded | downloading | paused |
+  loading | ready | failed`; `models` carries per-entry
+  `{id, label, bits, size_bytes, downloaded, active}`.
+- `GET /assistant/models` — the catalog and per-entry state.
+- `POST /assistant/model/download {model?}` — explicit, idempotent,
+  resumable download (Hugging Face cache), then load. Defaults to the
+  selected model.
+- `POST /assistant/model/use {model}` — switch the resident model (unloads
+  the previous weights first).
+- `POST /assistant/model/cancel` — abort an in-flight download; the entry
+  becomes `paused` with partial files kept for resume.
 - `POST /v1/chat/completions` — OpenAI-compatible subset (`messages`,
   `tools`, `stream`). Streaming replies are SSE `data:` chunks; Qwen XML
   tool calls are parsed into OpenAI `tool_calls` deltas; `<think>` content
   is stripped. Without the extra (or an unloaded model) the endpoints return
   501/409 so the app can explain the state.
+
+`snapshot_download` internals: cancellation is delivered through a
+`tqdm_class` that raises when the cancel event is set; complete files are
+skipped on the next call, so resume continues from the partial cache.
 
 ## Testing
 

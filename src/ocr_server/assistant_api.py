@@ -1,4 +1,4 @@
-"""Assistant HTTP surface: status, explicit download, OpenAI-compatible chat.
+"""Assistant HTTP surface: catalog, model lifecycle, OpenAI-compatible chat.
 
 The chat endpoint is a strict subset of the OpenAI chat-completions wire
 format so the app's TanStack AI `openaiCompatible` adapter can talk to it:
@@ -16,8 +16,17 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
 from . import assistant as assistant_runtime
-from .assistant import AssistantUnavailable, ModelNotReady
-from .schemas import AssistantStatus
+from .assistant import (
+    AssistantBusy,
+    AssistantUnavailable,
+    ModelNotReady,
+)
+from .schemas import (
+    AssistantModel,
+    AssistantModelRequest,
+    AssistantModelsResponse,
+    AssistantStatus,
+)
 
 router = APIRouter()
 
@@ -58,7 +67,11 @@ def _preflight(runtime: assistant_runtime.AssistantRuntime) -> None:
             status.HTTP_501_NOT_IMPLEMENTED,
             runtime.detail or "assistant runtime is not available",
         )
-    if not runtime.loaded and runtime.state in ("not_downloaded", "failed"):
+    if not runtime.loaded and runtime.state in (
+        "not_downloaded",
+        "paused",
+        "failed",
+    ):
         raise HTTPException(
             status.HTTP_409_CONFLICT,
             runtime.detail or "assistant model is not ready; download it first",
@@ -70,17 +83,53 @@ async def assistant_status() -> AssistantStatus:
     return AssistantStatus(**assistant_runtime.get_runtime().status())
 
 
+@router.get("/assistant/models", response_model=AssistantModelsResponse)
+async def assistant_models() -> AssistantModelsResponse:
+    runtime = assistant_runtime.get_runtime()
+    return AssistantModelsResponse(
+        available=runtime.available,
+        models=[AssistantModel(**entry) for entry in runtime.models()],
+    )
+
+
 @router.post(
     "/assistant/model/download",
     response_model=AssistantStatus,
     status_code=status.HTTP_202_ACCEPTED,
 )
-async def assistant_download() -> AssistantStatus:
+async def assistant_download(
+    request: AssistantModelRequest | None = None,
+) -> AssistantStatus:
     runtime = assistant_runtime.get_runtime()
     try:
-        runtime.start_download()
+        runtime.start_download(request.model if request else None)
     except AssistantUnavailable as exc:
         raise HTTPException(status.HTTP_501_NOT_IMPLEMENTED, str(exc)) from exc
+    except AssistantBusy as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    return AssistantStatus(**runtime.status())
+
+
+@router.post("/assistant/model/use", response_model=AssistantStatus)
+async def assistant_use(request: AssistantModelRequest) -> AssistantStatus:
+    runtime = assistant_runtime.get_runtime()
+    if request.model is None:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "model is required"
+        )
+    try:
+        runtime.use(request.model)
+    except AssistantUnavailable as exc:
+        raise HTTPException(status.HTTP_501_NOT_IMPLEMENTED, str(exc)) from exc
+    except ModelNotReady as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    return AssistantStatus(**runtime.status())
+
+
+@router.post("/assistant/model/cancel", response_model=AssistantStatus)
+async def assistant_cancel() -> AssistantStatus:
+    runtime = assistant_runtime.get_runtime()
+    runtime.cancel_download()
     return AssistantStatus(**runtime.status())
 
 

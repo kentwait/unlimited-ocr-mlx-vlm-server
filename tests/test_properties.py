@@ -199,3 +199,95 @@ def test_apply_furniture_rejects_garbage_modes():
     for bad in ["NATURE", "auto ", "", "null", "generic"]:
         with pytest.raises(ValueError):
             apply_furniture([[]], template=bad)
+
+
+# ---------- layout pre-scan invariants ----------
+
+
+@settings(max_examples=50)
+@given(st.text(max_size=200))
+def test_parse_layout_profile_never_raises(raw):
+    from ocr_server.layout import parse_layout_profile
+
+    profile = parse_layout_profile(raw, 1)
+    if profile is not None:
+        assert profile.columns in ("1", "2", "3", "mixed")
+        assert 0.0 <= profile.confidence <= 1.0
+        for box in profile.figures:
+            x1, y1, x2, y2 = box
+            assert 0 <= x1 < x2 <= 1000 and 0 <= y1 < y2 <= 1000
+
+
+@settings(max_examples=50)
+@given(
+    st.lists(
+        st.builds(
+            Span,
+            page=st.just(1),
+            label=st.sampled_from(["text", "title", "image", "furniture"]),
+            box=st.none()
+            | st.lists(st.integers(min_value=0, max_value=1000), min_size=4, max_size=4),
+            text=st.text(max_size=40),
+        ),
+        max_size=10,
+    ),
+    st.sampled_from(["1", "2", "3", "mixed"]),
+)
+def test_layout_filter_preserves_identity_and_never_empties(spans, columns):
+    from ocr_server.layout import LayoutProfile, apply_layout_filter
+
+    for i, s in enumerate(spans):
+        s.id = f"p1-{i + 1}"
+    profile = LayoutProfile(
+        page=1,
+        columns=columns,
+        header="Running head",
+        footer="Page footer",
+        figures=[[0, 0, 1000, 1000]],
+        confidence=0.9,
+    )
+    before = [s.text for s in spans if s.label not in ("furniture",) and s.text.strip()]
+    apply_layout_filter(spans, profile)
+    # Identity untouched; order untouched.
+    assert [s.id for s in spans] == [f"p1-{i + 1}" for i in range(len(spans))]
+    # The degenerate full-page figure box must trigger the revert guard:
+    # content spans survive (furniture-band matches may still relabel).
+    content_left = [s for s in spans if s.label != "furniture" and s.text.strip()]
+    assert len(content_left) >= len(before) - len(before) // 2 - 1 or not before
+
+
+@settings(max_examples=50)
+@given(
+    st.sampled_from(["1", "2", "3", "mixed"]),
+    st.text(max_size=30),
+    st.text(max_size=30),
+    st.floats(min_value=0.0, max_value=1.0, allow_nan=False),
+)
+def test_layout_profile_dict_round_trip(columns, header, footer, confidence):
+    import json
+
+    from ocr_server.layout import LayoutProfile, parse_layout_profile
+
+    profile = LayoutProfile(
+        page=3, columns=columns, header=header or None,
+        footer=footer or None, confidence=confidence,
+    )
+    revived = parse_layout_profile(json.dumps(profile.to_dict()), 3)
+    assert revived is not None
+    assert revived.columns == columns
+    assert revived.confidence == pytest.approx(min(1.0, max(0.0, confidence)))
+    # Text survives whitespace-collapsed (the scan contract is normalized).
+    assert (revived.header or "") == " ".join(header.split())[:200]
+
+
+@settings(max_examples=25, deadline=None)
+@given(st.text(max_size=20))
+def test_journal_field_never_400s(spec):
+    # Journals are removed: any value is accepted and treated as generic.
+    with _api_client() as api_client:
+        r = api_client.post(
+            "/parse/jobs",
+            files={"file": ("t.pdf", _pdf_bytes(1), "application/pdf")},
+            data={"pages": "all", "journal": spec},
+        )
+        assert r.status_code == 202

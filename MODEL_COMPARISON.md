@@ -4,8 +4,8 @@
 > and work dir are configured in the **USER CONFIG** block at the top of
 > `scripts/compare_ocr.py` and `scripts/compare_cleanup.py` (env overrides
 > available — see [README.md](README.md#configuration) → *Configuration →
-> Benchmark scripts*). Server-side knobs (`OCR_MODEL_REF`, `OCR_CLEANUP`,
-> `OCR_CLEANUP_MODEL`, per-request `dpi` / `ocr_model`) are documented in the
+> Benchmark scripts*). Server-side knobs (`OCR_MODEL_REF`, `OCR_SUPPORT`,
+> `OCR_SUPPORT_MODEL`, per-request `dpi` / `ocr_model`) are documented in the
 > same README section.
 
 All numbers measured on this machine (Apple M4 Max, 36 GB unified memory) with
@@ -111,12 +111,12 @@ Resident set = OCR engine + cleanup engine (+ alternate OCR if enabled).
 |---|---|---|---|
 | ≥ 16 GB free | bf16 (6.5 GB) + Qwen3.5-0.8B-q8 (1 GB) ≈ **9 GB** | — | most stable: no OCR loops, best cleanup; ~1.4× slower than mxfp8 |
 | ≥ 12 GB free | mxfp8 (3.7 GB) + 0.8B-q8 (1 GB) ≈ **5 GB** | — | **current default**; fast, occasionally loop-truncated dense pages (mitigated by early-stop; retry at dpi 250) |
-| 8–12 GB | mxfp8 + Qwen3.5-0.8B-4bit ≈ 4.5 GB | — | accept q4 cleanup ramble risk, or disable cleanup (`OCR_CLEANUP=0`) |
+| 8–12 GB | mxfp8 + Qwen3.5-0.8B-4bit ≈ 4.5 GB | — | accept q4 cleanup ramble risk, or disable the support stage (`OCR_SUPPORT=0`) |
 | < 8 GB | mxfp8 only (3.7 GB) | disabled | pre-clean only; skip LLM cleanup |
 
 Switching knobs: `OCR_MODEL_REF` (server default), `ocr_model` form field
 (`bf16` shortcut or any HF repo/local path — loads lazily and stays resident),
-`OCR_CLEANUP_MODEL`, `OCR_CLEANUP=0`.
+`OCR_SUPPORT_MODEL`, `OCR_SUPPORT=0`.
 
 ## Chosen defaults
 

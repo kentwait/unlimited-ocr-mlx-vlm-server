@@ -1,6 +1,10 @@
-"""Optional post-OCR checking stage — operates WITHIN spans.
+"""Support stage: layout pre-scan plus post-OCR correction, both WITHIN spans.
 
 Pipeline per page:
+  0. Layout pre-scan (vision): the support model looks at a low-resolution
+     page thumbnail and reports a coarse LayoutProfile (column count,
+     running header/footer text, large figure boxes). Any failure yields
+     None and the pipeline proceeds unhinted.
   1. OCR output is parsed into spans (see ocr_server.spans); structural
      labels are excluded.
   2. Content spans are numbered and sent to the LLM (Qwen3.5-0.8B MLX 8-bit
@@ -12,16 +16,20 @@ Pipeline per page:
   3. The numbered output is parsed strictly: every fragment number must be
      present exactly once, else the page falls back to the original spans.
 
-The server never asks the checker for markdown — span texts are corrected
-in place and markdown rendering is downstream (server-side frozen render;
-Paperhub renders its own). Every LLM edit is audited per span: the original
-fragment is word-diffed against the corrected one, and each changed word is
-attributed as
+The server never asks the support model for markdown — span texts are
+corrected in place and markdown rendering is downstream (server-side
+frozen render; Paperhub renders its own). Every LLM edit is audited per
+span: the original fragment is word-diffed against the corrected one, and
+each changed word is attributed as
   - text-layer-backed: the replacement exists in the page's text layer
   - ocr-vocab-backed:  replacement appears elsewhere in the fragment/page
   - invented:          replacement exists in neither (model "intuition") —
                        the hallucination-risk category, surfaced in logs
-Corrections are logged at INFO per page and summarized in CleanupStats.
+Corrections are logged at INFO per page and summarized in SupportStats.
+
+Naming history: this was the "checker"/"cleanup" stage (OCR_CLEANUP* env,
+CleanupEngine). Those names survive as deprecated aliases; the canonical
+names are now support/* (OCR_SUPPORT* env, SupportEngine).
 """
 
 from __future__ import annotations
@@ -32,26 +40,31 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from .engine import _dedupe_long_lines, _loop_period
+from .layout import LayoutProfile, parse_layout_profile
 from .prompts import PromptRegistry
-from .spans import Span, drop_labels_for
+from .spans import STRUCTURAL_LABELS, Span
 
 log = logging.getLogger("ocr_server")
 
-DEFAULT_CLEANUP_MODEL = "mlx-community/Qwen3.5-0.8B-MLX-8bit"
+#: Canonical support-model ref. OCR_CLEANUP_MODEL is still honored as a
+#: fallback (see api._get_support_engine); this constant is the default.
+DEFAULT_SUPPORT_MODEL = "mlx-community/Qwen3.5-0.8B-MLX-8bit"
+#: Deprecated alias (pre-rename name).
+DEFAULT_CLEANUP_MODEL = DEFAULT_SUPPORT_MODEL
 
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
 _MARKDOWN_RE = re.compile(r"[#*_>`\[\]()\\|⁰¹²³⁴⁵⁶⁷⁸⁹₀₁₂₃₄₅₆₇₈₉]")
 
 
 # ---------------------------------------------------------------------------
-# Numbered-fragment format (the checker's I/O contract)
+# Numbered-fragment format (the support model's I/O contract)
 # ---------------------------------------------------------------------------
 
 _SPAN_MARK_RE = re.compile(r"^[ \t]*\[(\d+)\][ \t]?", re.MULTILINE)
 
 
 def format_fragments(spans: list[Span]) -> str:
-    """Render spans as the checker's numbered plain-text list: a `[n]`
+    """Render spans as the support model's numbered plain-text list: a `[n]`
     marker line per fragment followed by its text."""
     lines: list[str] = []
     for i, s in enumerate(spans, 1):
@@ -61,7 +74,7 @@ def format_fragments(spans: list[Span]) -> str:
 
 
 def parse_numbered_fragments(output: str, expected: int) -> dict[int, str] | None:
-    """Parse checker output back into `{number: text}`.
+    """Parse support output back into `{number: text}`.
 
     Strict: returns None unless every number in 1..expected appears exactly
     once (duplicate, missing, or extra numbers mean the model broke the
@@ -113,7 +126,7 @@ def _content_words(text: str) -> list[str]:
 
 @dataclass
 class CorrectionAudit:
-    """Diff between the checker's input and output, split into:
+    """Diff between the support model's input and output, split into:
 
     - content edits: word-level changes (the misspellings/hallucinations)
       attributed to text-layer / OCR vocabulary / invented
@@ -140,7 +153,7 @@ class CorrectionAudit:
     def log_summary(self, page_label: str) -> None:
         if self.formatting_only:
             log.info(
-                "%s: checker formatting-only (%d -> %d content words, "
+                "%s: support formatting-only (%d -> %d content words, "
                 "+%d/-%d markdown-structure words) — no content edits",
                 page_label,
                 self.n_words_in,
@@ -150,13 +163,13 @@ class CorrectionAudit:
             )
             return
         if self.n_edits == 0:
-            log.info("%s: checker made no content edits", page_label)
+            log.info("%s: support made no content edits", page_label)
             return
         samples = lambda xs: ", ".join(repr(x) for x in xs[:6]) + (
             f" …(+{len(xs) - 6})" if len(xs) > 6 else ""
         )
         log.info(
-            "%s: checker CONTENT edits — %d | text-layer-backed: %s | "
+            "%s: support CONTENT edits — %d | text-layer-backed: %s | "
             "ocr-vocab-backed: %s | INVENTED (no source): %s",
             page_label,
             self.n_edits,
@@ -169,7 +182,7 @@ class CorrectionAudit:
 def audit_corrections(
     before: str, after: str, text_layer: str | None
 ) -> CorrectionAudit:
-    """Content-edit diff between checker input and output.
+    """Content-edit diff between support input and output.
 
     Works on normalized *content word multisets* (order-independent, so
     markdown reflow doesn't produce phantom edits): counts words removed from
@@ -186,8 +199,8 @@ def audit_corrections(
     tl_vocab = {_norm_word(w) for w in _WORD_RE.findall(text_layer or "")}
     ocr_vocab = set(Counter(b))
 
-    removed = Counter(b) - Counter(a)  # words dropped by the checker
-    added = Counter(a) - Counter(b)  # words introduced by the checker
+    removed = Counter(b) - Counter(a)  # words dropped by the support model
+    added = Counter(a) - Counter(b)  # words introduced by the support model
     audit.format_removed_words = sum(removed.values())
     audit.format_added_words = sum(added.values())
 
@@ -224,30 +237,34 @@ def merge_audits(audits: list[CorrectionAudit]) -> CorrectionAudit:
 
 
 # ---------------------------------------------------------------------------
-# Cleanup engine
+# Support engine
 # ---------------------------------------------------------------------------
 
 @dataclass
-class CleanupStats:
-    method: str  # "check-spans-digital" | "check-spans-proofread" | "reflow+..."
+class SupportStats:
+    method: str  # "support-spans-digital" | "support-spans-proofread" | "reflow+..."
     elapsed_s: float
     tokens: int | None = None
     early_stop: bool = False
     audit: CorrectionAudit | None = None
 
 
-class CleanupEngine:
-    """Lazy-loaded small LLM that corrects OCR text WITHIN spans (never
-    across them, never into markdown)."""
+#: Deprecated alias (pre-rename name).
+CleanupStats = SupportStats
+
+
+class SupportEngine:
+    """Small vision LLM for the support stage: layout pre-scans plus OCR
+    text correction WITHIN spans (never across them, never into markdown)."""
 
     def __init__(
         self,
-        model_ref: str = DEFAULT_CLEANUP_MODEL,
+        model_ref: str = DEFAULT_SUPPORT_MODEL,
         prompts: PromptRegistry | None = None,
     ):
         if prompts is None or not prompts.loaded:
             raise ValueError(
-                "CleanupEngine requires a loaded PromptRegistry "
+                "SupportEngine requires a loaded PromptRegistry "
                 "(server startup loads it; see ocr_server.prompts)"
             )
         self.model_ref = model_ref
@@ -299,17 +316,86 @@ class CleanupEngine:
         text = _dedupe_long_lines(text)
         return text, len(ids), early_stop
 
+    def _generate_vision(  # pragma: no cover - runs the MLX model
+        self, prompt: str, image_path: str, max_tokens: int
+    ) -> tuple[str, int, bool]:
+        # pragma: no mutate block - requires MLX weights
+        """Vision generate for the layout pre-scan (thumbnail in, JSON out)."""
+        import time as _time
+
+        from mlx_vlm.generate.dispatch import stream_generate
+        from mlx_vlm.prompt_utils import apply_chat_template
+
+        formatted = apply_chat_template(self.processor, self.model.config, prompt)
+        ids: list[int] = []
+        early_stop = False
+        for resp in stream_generate(
+            self.model,
+            self.processor,
+            formatted,
+            image=image_path,
+            max_tokens=max_tokens,
+            temperature=0.0,
+            enable_thinking=False,
+        ):
+            if resp.is_draft:
+                continue
+            if resp.token is not None:
+                ids.append(int(resp.token))
+                if len(ids) % 32 == 0 and _loop_period(ids) is not None:
+                    early_stop = True
+                    break
+        text = self.processor.tokenizer.decode(
+            ids, skip_special_tokens=True
+        ).strip()
+        return text, len(ids), early_stop
+
+    def scan_layout(self, image_path: str, page: int, max_tokens: int = 384) -> LayoutProfile | None:
+        """Coarse vision pre-scan of one page thumbnail.
+
+        Total: never raises on model misbehavior — any failure (load,
+        generate, unparsable output) logs and returns None, and the
+        pipeline proceeds unhinted.
+        """
+        import time as _time
+
+        t0 = _time.perf_counter()
+        try:
+            prompt = self._prompts.render("layout_scan", page=page)
+            self.load()
+            text, _, _ = self._generate_vision(prompt, image_path, max_tokens)
+        except Exception as exc:
+            log.warning("page %d: layout scan failed (%s) — proceeding unhinted", page, exc)
+            return None
+        profile = parse_layout_profile(text, page)
+        if profile is None:
+            log.warning("page %d: layout scan unparsable — proceeding unhinted", page)
+            return None
+        profile.elapsed_s = _time.perf_counter() - t0
+        log.info(
+            "page %d: layout columns=%s furniture=%s figures=%d conf=%.2f (%.1fs)",
+            page,
+            profile.columns,
+            bool(profile.header or profile.footer),
+            len(profile.figures),
+            profile.confidence,
+            profile.elapsed_s,
+        )
+        return profile
+
     def check_spans(
         self,
         spans: list[Span],
         text_layer: str | None,
         max_tokens: int = 6144,
-        journal: str = "generic",
-    ) -> tuple[list[Span], CleanupStats]:
+    ) -> tuple[list[Span], SupportStats]:
         """Correct OCR text WITHIN each content span; returns (checked_spans,
         stats). Identity is preserved: labels, boxes, and span ids survive
-        unchanged — only `text` may differ. Structural labels (per the
-        journal's drop set) and empty fragments are never sent to the model.
+        unchanged — only `text` may differ. Structural labels and empty
+        fragments are never sent to the model.
+
+        The server is journal-agnostic (per-document layout comes from the
+        pre-scan), so the universal structural drop set always applies.
 
         Strict contract: the model must echo every fragment number exactly
         once. Any violation (or degenerate output) falls back to the
@@ -317,17 +403,17 @@ class CleanupEngine:
         import time as _time
 
         t0 = _time.perf_counter()
-        drop = drop_labels_for(journal)
+        drop = STRUCTURAL_LABELS
         numbered: list[tuple[int, Span]] = [
             (idx, s)
             for idx, s in enumerate(spans)
             if s.label not in drop and s.text.strip()
         ]
 
-        def originals() -> tuple[list[Span], CleanupStats]:
+        def originals() -> tuple[list[Span], SupportStats]:
             audit = CorrectionAudit()
             audit.formatting_only = True
-            return list(spans), CleanupStats(
+            return list(spans), SupportStats(
                 method=method,
                 elapsed_s=_time.perf_counter() - t0,
                 audit=audit,
@@ -336,17 +422,17 @@ class CleanupEngine:
         page = spans[0].page if spans else 1
         has_text_layer = bool(text_layer) and len(text_layer.strip()) >= 200
         if has_text_layer:
-            method = "check-spans-digital"
+            method = "support-spans-digital"
             prompt = self._prompts.render(
-                "checker_digital",
+                "support_digital",
                 fragments=format_fragments([s for _, s in numbered]),
                 text_layer=(text_layer or "").strip(),
                 page=page,
             )
         else:
-            method = "check-spans-proofread"
+            method = "support-spans-proofread"
             prompt = self._prompts.render(
-                "checker_scan",
+                "support_scan",
                 fragments=format_fragments([s for _, s in numbered]),
                 page=page,
             )
@@ -359,7 +445,7 @@ class CleanupEngine:
         frags = parse_numbered_fragments(text, len(numbered))
         if frags is None:
             log.warning(
-                "checker output broke the numbered contract (%d fragments "
+                "support output broke the numbered contract (%d fragments "
                 "expected) — keeping original spans",
                 len(numbered),
             )
@@ -382,7 +468,7 @@ class CleanupEngine:
             corrected[idx] = replace(s, text=new_text)
         if total_out < 0.3 * max(1, total_in):
             log.warning(
-                "checker output degenerate (%d chars < 30%% of input) — "
+                "support output degenerate (%d chars < 30%% of input) — "
                 "keeping original spans",
                 total_out,
             )
@@ -392,7 +478,7 @@ class CleanupEngine:
             formatting_only=True
         )
         audit.log_summary(f"page {page}")
-        return corrected, CleanupStats(
+        return corrected, SupportStats(
             method=method,
             elapsed_s=_time.perf_counter() - t0,
             tokens=n_tokens,
@@ -408,13 +494,13 @@ class CleanupEngine:
         prompt_override: str | None = None,
         text_layer: str | None = None,
         max_tokens: int = 6144,
-    ) -> tuple[str, CleanupStats]:
+    ) -> tuple[str, SupportStats]:
         """LLM reflow pass over client-rendered markdown.
 
         Unlike check_spans (which corrects WITHIN spans and never produces
         markdown), this starts from already-rendered markdown and applies a
-        caller-supplied prompt — the seam Paperhub's journal reflow uses to
-        reuse the resident checker model with client-owned prompts.
+        caller-supplied prompt — the seam Paperhub's reflow uses to reuse
+        the resident support model with client-owned prompts.
         `journal` is an opaque label echoed back in stats; the server never
         interprets it. prompt_override supports plain {{markdown}} and
         {{journal}} substitution (deliberately not Jinja: the caller is
@@ -454,10 +540,14 @@ class CleanupEngine:
             )
             text = source
 
-        return text, CleanupStats(
+        return text, SupportStats(
             method=method,
             elapsed_s=_time.perf_counter() - t0,
             tokens=n_tokens,
             early_stop=early_stop,
             audit=audit,
         )
+
+
+#: Deprecated alias (pre-rename name).
+CleanupEngine = SupportEngine

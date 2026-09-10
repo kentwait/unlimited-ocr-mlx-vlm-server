@@ -4,7 +4,7 @@
 > repo) now lives in the Paperhub repo (history preserved via renames), which
 > consumes this server as a pinned git submodule over the `spans_jsonl` +
 > sidecar contract. This repo stays server-only: generic PDF → markdown
-> (OCR + checker LLM + generic repetition-based furniture removal).
+> (OCR + support LLM + generic repetition-based furniture removal).
 > Journal-specific templates moved to Paperhub's reflow layer, so the
 > `furniture` form field now accepts only `auto` (generic fingerprinting)
 > or `none` (disabled); anything else is a 400.
@@ -54,14 +54,14 @@ uv run ocr-server --host 0.0.0.0 --port 8300 \
 | Bind address | `--host` | `OCR_HOST` | `127.0.0.1` (set `0.0.0.0` for LAN access) |
 | Port | `--port` | `OCR_PORT` | `8300` |
 | OCR model | `--model-ref` | `OCR_MODEL_REF` | `sahilchachra/unlimited-ocr-mxfp8-mlx` |
-| Cleanup stage | — | `OCR_CLEANUP` | `1` (set `0` to disable) |
-| Cleanup model | — | `OCR_CLEANUP_MODEL` | `mlx-community/Qwen3.5-0.8B-MLX-8bit` |
+| Support stage | — | `OCR_SUPPORT` | `1` (set `0` to disable; `OCR_CLEANUP` still honored as fallback) |
+| Support model | — | `OCR_SUPPORT_MODEL` | `mlx-community/Qwen3.5-0.8B-MLX-8bit` (`OCR_CLEANUP_MODEL` still honored as fallback) |
 | Prompts directory | — | `OCR_PROMPTS_DIR` | `./prompts` (loaded at startup; restart to apply edits) |
 | Stub engine (dev) | `--fake-engine` | `OCR_FAKE_ENGINE=1` | off |
 
 `--model-ref` / `OCR_MODEL_REF` accept any HF repo id or local directory
-containing an mlx-vlm model. The cleanup model only loads on first use, so
-`OCR_CLEANUP=0` also saves its memory entirely.
+containing an mlx-vlm model. The support model only loads on first use, so
+`OCR_SUPPORT=0` also saves its memory entirely.
 
 ### Per-request (multipart form fields)
 
@@ -105,13 +105,14 @@ Run `compare_ocr.py` first — it renders pages and caches raw OCR text that
 
 ### Prompts (`prompts/*.md`)
 
-The checker LLM's prompts are **Markdown + Jinja2 templates** in `prompts/`,
+The support LLM's prompts are **Markdown + Jinja2 templates** in `prompts/`,
 loaded once at server startup — edit and restart to change.
 
 | file | used for | variables |
 |---|---|---|
-| `prompts/checker_digital.md` | pages with a text layer | `{{ ocr }}`, `{{ text_layer }}`, `{{ page }}` |
-| `prompts/checker_scan.md` | scanned pages (no text layer) | `{{ ocr }}`, `{{ page }}` |
+| `prompts/support_digital.md` | pages with a text layer | `{{ fragments }}`, `{{ text_layer }}`, `{{ page }}` |
+| `prompts/support_scan.md` | scanned pages (no text layer) | `{{ fragments }}`, `{{ page }}` |
+| `prompts/layout_scan.md` | layout pre-scan (vision, low-res thumbnail) | `{{ page }}` |
 
 Rules: templates are passed to the model verbatim (write them as Markdown —
 headers/fences are fine); every variable is required (`StrictUndefined` — a
@@ -143,14 +144,15 @@ repo's.
   loop-sensitive dense batches (see `MODEL_COMPARISON.md`)
 
 Both return `{kind, n_pages, results: [{page, markdown, elapsed_s, tokens, tps,
-peak_memory_gb, early_stop, cleanup_method, cleanup_elapsed_s, cleanup_early_stop,
+peak_memory_gb, early_stop, support_method, support_elapsed_s, support_early_stop,
+`layout` (pre-scan profile),
 corrections, spans_jsonl}], total_elapsed_s}`.
 
 - **`spans_jsonl`** — the structured OCR intermediate: one JSON record per
   detected span, `{"page", "label" (title/text/image/…), "box" ([x1,y1,x2,y2]
   in the model's 0–1000 space), "text"}`. Markdown is rendered deterministically
   from these spans; consume the JSONL directly if you want boxes/labels.
-- **`corrections`** — what the checker changed, content vs formatting:
+- **`corrections`** — what the support model changed, content vs formatting:
   `{text_layer_backed, ocr_vocab_backed, invented, formatting_only,
   format_added_words, format_removed_words, samples_invented,
   samples_text_layer_backed}`. Content edits are word-level changes; `invented`
@@ -158,9 +160,11 @@ corrections, spans_jsonl}], total_elapsed_s}`.
   audit these). Formatting is markdown-transform churn, counted but not
   attributed.
 
-### Checker stage (default on)
+### Layout pre-scan + support stage (default on)
 
-All pages get the checker LLM. Digital pages: reconcile with the text layer
+Every page first gets a cheap vision pre-scan by the support model on a downscaled thumbnail: column count, running header/footer text, and large figure boxes. The profile is used twice — as a one-sentence hint appended to the OCR prompt ("two-column, big figure bottom-right — read columns top-to-bottom, skip it") and as a deterministic span filter (figure-interior and furniture text relabeled, never renumbered). Any scan failure falls back to the unhinted pipeline. Gundam tiling stays always on.
+
+All pages then get the support LLM. Digital pages: reconcile with the text layer
 (ground truth for wording/numbers) + proofread. Scanned pages (no text layer):
 proofread-only prompt — fix obvious OCR misspellings from context, never
 paraphrase; every edit is attributed in `corrections` and logged at INFO
@@ -168,7 +172,7 @@ paraphrase; every edit is attributed in `corrections` and logged at INFO
 visible. Strips `<|det|>` markers, fixes loop remnants, emits clean Markdown
 (~5-20 s/page extra).
 
-Disable with `OCR_CLEANUP=0`; swap the model with `OCR_CLEANUP_MODEL=<hf-repo>`.
+Disable with `OCR_SUPPORT=0`; swap the model with `OCR_SUPPORT_MODEL=<hf-repo>`.
 
 `POST /parse/jobs` + `GET /parse/jobs/{job_id}` — same as `/parse/pdf` but async
 (202 + `job_id`; poll until `done`/`error`). Use for long documents.

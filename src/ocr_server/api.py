@@ -23,10 +23,11 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, sta
 from .engine import DEFAULT_MODEL_REF, OcrEngine
 from .fake import FakeEngine
 from .furniture import apply_furniture
+from .layout import LayoutProfile, apply_layout_filter, layout_hint
 from .pages import parse_pages_spec
 from .pdfrender import render_pdf_pages
 from .prompts import PROMPTS_DIR as PROMPTS_DIR_DEFAULT, PromptRegistry
-from .spans import JOURNALS, parse_spans, render_markdown, spans_to_jsonl
+from .spans import parse_spans, render_markdown, spans_to_jsonl
 from .schemas import (
     REFLOW_CONTRACT_VERSION,
     DocumentParseResponse,
@@ -37,7 +38,7 @@ from .schemas import (
     ReflowRequest,
     ReflowResponse,
 )
-from .cleanup import CleanupEngine, DEFAULT_CLEANUP_MODEL
+from .cleanup import DEFAULT_SUPPORT_MODEL, SupportEngine
 
 log = logging.getLogger("ocr_server")
 
@@ -47,7 +48,7 @@ ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
 ALLOWED_PDF_TYPES = {"application/pdf", "application/octet-stream"}
 TEMP_DIR = Path("/tmp/unlimited-ocr-server")
 
-_cleanup_engine: CleanupEngine | None = None
+_support_engine: SupportEngine | None = None
 _prompt_registry: PromptRegistry | None = None
 
 
@@ -61,19 +62,29 @@ def _get_prompt_registry() -> PromptRegistry:
     return _prompt_registry
 
 
-def _get_cleanup_engine() -> CleanupEngine | None:
+def _get_support_engine() -> SupportEngine | None:
     """Lazy singleton; None when disabled via env or in fake-engine mode."""
-    global _cleanup_engine
+    global _support_engine
     if holder.is_fake:
         return None
-    enabled = os.environ.get("OCR_CLEANUP", "1").strip().lower() not in ("0", "false", "no")
+    enabled = os.environ.get(
+        "OCR_SUPPORT", os.environ.get("OCR_CLEANUP", "1")
+    ).strip().lower() not in ("0", "false", "no")
     if not enabled:
         return None
-    if _cleanup_engine is None:
-        model = os.environ.get("OCR_CLEANUP_MODEL", DEFAULT_CLEANUP_MODEL)
-        _cleanup_engine = CleanupEngine(model, prompts=_get_prompt_registry())
-        log.info("cleanup model configured: %s (loads on first use)", model)
-    return _cleanup_engine
+    if _support_engine is None:
+        model = os.environ.get(
+            "OCR_SUPPORT_MODEL",
+            os.environ.get("OCR_CLEANUP_MODEL", DEFAULT_SUPPORT_MODEL),
+        )
+        _support_engine = SupportEngine(model, prompts=_get_prompt_registry())
+        log.info("support model configured: %s (loads on first use)", model)
+    return _support_engine
+
+
+#: Deprecated alias (pre-rename name).
+def _get_cleanup_engine() -> SupportEngine | None:
+    return _get_support_engine()
 
 
 DEFAULT_MODEL_BF16 = "mlx-community/Unlimited-OCR-bf16"
@@ -224,25 +235,84 @@ async def _infer_image_path(
         return await anyio.to_thread.run_sync(_run_inference_sync, path, params, engine)
 
 
-def _run_span_check_sync(
-    cleanup: "CleanupEngine",
+def _run_support_check_sync(
+    support: "SupportEngine",
     spans: list,
     text_layer: str | None,
-    journal: str = "generic",
 ):
-    return cleanup.check_spans(spans, text_layer, journal=journal)
+    return support.check_spans(spans, text_layer)
 
 
-async def _run_span_check(
-    cleanup: "CleanupEngine",
+async def _run_support_check(
+    support: "SupportEngine",
     spans: list,
     text_layer: str | None,
-    journal: str = "generic",
 ):
     async with infer_limiter:
         return await anyio.to_thread.run_sync(
-            _run_span_check_sync, cleanup, spans, text_layer, journal
+            _run_support_check_sync, support, spans, text_layer
         )
+
+
+#: Deprecated aliases (pre-rename names).
+_run_span_check_sync = _run_support_check_sync
+_run_span_check = _run_support_check
+
+
+def _scan_layout_sync(
+    support: "SupportEngine",
+    thumb_path: Path,
+    page_num: int,
+) -> LayoutProfile | None:
+    return support.scan_layout(str(thumb_path), page_num)
+
+
+async def _run_layout_scan(
+    support: "SupportEngine",
+    thumb_path: Path,
+    page_num: int,
+) -> LayoutProfile | None:
+    async with infer_limiter:
+        return await anyio.to_thread.run_sync(
+            _scan_layout_sync, support, thumb_path, page_num
+        )
+
+
+def _fake_layout(page_num: int) -> LayoutProfile:
+    """Deterministic canned profile for --fake-engine mode (no weights).
+
+    Exercises the hint + filter plumbing end-to-end in dev/contract tests
+    without a model: single column, no furniture, no figures.
+    """
+    return LayoutProfile(page=page_num, columns="1", confidence=1.0, method="fake-scan")
+
+
+def _thumbnail_for_scan(img_path: Path, max_dim: int = 1024) -> Path:
+    """Downscaled copy of a rendered page for the layout pre-scan.
+
+    The OCR pass needs full resolution; the scan only needs global
+    structure, so a small thumbnail keeps the support VLM fast and lean.
+    CPU-only (Pillow); callers run it outside infer_limiter.
+    """
+    from PIL import Image
+
+    thumb_path = img_path.with_name(f"thumb-{img_path.stem}.png")
+    with Image.open(img_path) as img:
+        img = img.convert("RGB")
+        img.thumbnail((max_dim, max_dim))
+        img.save(str(thumb_path))
+    return thumb_path
+
+
+def _ocr_params_with_hint(params: InferenceParams, hint: str) -> InferenceParams:
+    """OCR params with the layout hint appended to the prompt.
+
+    model_copy skips validation (the base prompt was already validated);
+    hints are server-generated sentences, not user input.
+    """
+    if not hint:
+        return params
+    return params.model_copy(update={"prompt": f"{params.prompt} {hint}"})
 
 
 def _params_from_form(
@@ -279,14 +349,13 @@ def _furniture_from_form(furniture: str) -> str:
 
 
 def _journal_from_form(journal: str) -> str:
-    """Eager `journal` field validation: fail fast with 400, including
-    before a background job is created (job errors are poll-only)."""
-    if journal not in JOURNALS:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            f"unknown journal {journal!r}: expected one of {', '.join(JOURNALS)}",
-        )
-    return journal
+    """Deprecated `journal` field: accepted and ignored (always generic).
+
+    Per-document layout now comes from the support model's pre-scan, so
+    there is nothing journal-specific left to select. Previously unknown
+    journals 400'd here; they are now accepted and treated as generic so
+    older clients keep working during the transition."""
+    return "generic"
 
 
 async def _parse_pdf_path(
@@ -300,7 +369,7 @@ async def _parse_pdf_path(
     journal: str = "generic",
     job: JobStatus | None = None,
 ) -> DocumentParseResponse:
-    """Open, render, and OCR a PDF file. Caller owns cleanup of `path`.
+    """Open, render, and OCR a PDF file. Caller owns deletion of `path`.
 
     When `job` is given, per-stage progress (phase/pages_done/pages_total) is
     written to it for client polling.
@@ -334,27 +403,56 @@ async def _parse_pdf_path(
         except Exception as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, f"render failed: {exc}") from exc
     finally:
-        pass  # doc kept open: text layers are pulled per page during cleanup
+        pass  # doc kept open: text layers are pulled per page during support
 
-    cleanup = _get_cleanup_engine()
+    support = _get_support_engine()
     engine = holder.get_ocr_engine(ocr_model)
 
+    # Layout pre-scan: one cheap vision call per page on downscaled
+    # thumbnails, fanned out concurrently. Inference itself serializes on
+    # infer_limiter (one MLX user); the gather overlaps thumbnail CPU work
+    # and avoids extra request round-trips. Any per-page failure yields
+    # None and that page runs unhinted. Reported inside phase "ocr".
     # Furniture pass needs the whole document's OCR first (cross-page
     # fingerprints), so run OCR for all pages, then process.
     page_ocr: list[tuple[int, Path, str, object, float]] = []
     total0 = time.perf_counter()
     try:
-        for page_num, img_path in zip(page_nums, rendered):
-            text, stats, elapsed = await _infer_image_path(img_path, params, engine)
+        if support is not None:
+            thumbs = [await anyio.to_thread.run_sync(_thumbnail_for_scan, p) for p in rendered]
+            if job is not None:
+                job.phase = "ocr"
+            layouts: list[LayoutProfile | None] = list(
+                await asyncio.gather(
+                    *(
+                        _run_layout_scan(support, thumb, n)
+                        for thumb, n in zip(thumbs, page_nums)
+                    )
+                )
+            )
+        elif holder.is_fake:
+            layouts = [_fake_layout(n) for n in page_nums]
+        else:
+            layouts = [None for _ in page_nums]
+        hints = [layout_hint(layout) for layout in layouts]
+
+        for (page_num, img_path), hint in zip(zip(page_nums, rendered), hints):
+            page_params = _ocr_params_with_hint(params, hint)
+            text, stats, elapsed = await _infer_image_path(img_path, page_params, engine)
             page_ocr.append((page_num, img_path, text, stats, elapsed))
             if job is not None:
                 job.phase = "ocr"
                 job.pages_done = len(page_ocr)
 
-        # Furniture removal on the span intermediate (generic repetition
-        # fingerprinting; "none" disables). Journal-specific templates live
-        # in Paperhub's reflow layer — this server stays journal-agnostic.
+        # Layout filter runs on the span intermediate BEFORE the generic
+        # furniture pass (relabel-only; span identity preserved). Then the
+        # generic repetition fingerprinting catches whatever the scan
+        # missed — the two passes are complementary, not exclusive.
         all_spans = [parse_spans(t, page=n) for n, _, t, _, _ in page_ocr]
+        layout_counts = [
+            apply_layout_filter(spans, layout)
+            for spans, layout in zip(all_spans, layouts)
+        ]
         try:
             finfo = apply_furniture(all_spans, template=furniture)
         except ValueError as exc:
@@ -370,13 +468,16 @@ async def _parse_pdf_path(
         page_markdowns = [render_markdown(spans, journal) for spans in all_spans]
 
         results: list[PageResult] = []
-        if job is not None and cleanup is not None:
-            # Fresh count for the checking stage: clients weight OCR and
-            # checking evenly, so pages_done restarts here (same total).
+        if job is not None and support is not None:
+            # Fresh count for the support stage: clients weight OCR and
+            # support evenly, so pages_done restarts here (same total).
             job.pages_done = 0
-        for i, ((page_num, img_path, text, stats, elapsed), spans, md) in enumerate(
-            zip(page_ocr, all_spans, page_markdowns)
+        for i, ((page_num, img_path, text, stats, elapsed), spans, md, layout, lcounts) in enumerate(
+            zip(page_ocr, all_spans, page_markdowns, layouts, layout_counts)
         ):
+            layout_dict = layout.to_dict() if layout is not None else None
+            if layout_dict is not None:
+                layout_dict.update(lcounts)
             page_res = PageResult(
                 page=page_num,
                 markdown=md,
@@ -385,15 +486,16 @@ async def _parse_pdf_path(
                 tps=round(getattr(stats, "tps", 0.0) or 0.0, 1) or None,
                 peak_memory_gb=round(getattr(stats, "peak_memory_gb", 0.0) or 0.0, 2) or None,
                 early_stop=bool(getattr(stats, "early_stop", False)),
+                layout=layout_dict,
                 spans_jsonl=spans_to_jsonl(spans),
             )
-            if cleanup is not None:
+            if support is not None:
                 # Text layer of THIS page (doc still open); None -> proofread path.
                 text_layer = doc[page_num - 1].get_text()
                 if job is not None:
-                    job.phase = "cleanup"
-                checked, cstats = await _run_span_check(
-                    cleanup, spans, text_layer, journal=journal
+                    job.phase = "support"
+                checked, cstats = await _run_support_check(
+                    support, spans, text_layer
                 )
                 if job is not None:
                     job.pages_done = i + 1
@@ -401,6 +503,10 @@ async def _parse_pdf_path(
                 # them so the two can never disagree.
                 page_res.markdown = render_markdown(checked, journal)
                 page_res.spans_jsonl = spans_to_jsonl(checked)
+                page_res.support_method = cstats.method
+                page_res.support_elapsed_s = round(cstats.elapsed_s, 3)
+                page_res.support_early_stop = cstats.early_stop
+                # Deprecated dual-write (pre-rename clients); remove next release.
                 page_res.cleanup_method = cstats.method
                 page_res.cleanup_elapsed_s = round(cstats.elapsed_s, 3)
                 page_res.cleanup_early_stop = cstats.early_stop
@@ -418,15 +524,17 @@ async def _parse_pdf_path(
                         "samples_text_layer_backed": audit.text_layer_backed[:8],
                     }
             log.info(
-                "page %d/%d done: ocr %.1fs (%d tok%s), furniture %d, cleanup %s %.1fs, %d chars",
+                "page %d/%d done: ocr %.1fs (%d tok%s), layout %s, furniture %d, support %s %.1fs, %d chars",
                 page_num,
                 len(page_nums),
                 elapsed,
                 getattr(stats, "tokens", 0) or 0,
                 ", early-stop" if getattr(stats, "early_stop", False) else "",
+                (layout.columns if layout is not None else "none")
+                + (f"+{lcounts['figures_skipped']}fig+{lcounts['furniture_flagged']}furn" if (lcounts["figures_skipped"] or lcounts["furniture_flagged"]) else ""),
                 doc_furniture["removed_by_page"].get(page_num, 0),
-                page_res.cleanup_method or "off",
-                page_res.cleanup_elapsed_s or 0.0,
+                page_res.support_method or "off",
+                page_res.support_elapsed_s or 0.0,
                 len(page_res.markdown),
             )
             results.append(page_res)
@@ -452,13 +560,14 @@ async def _parse_pdf_path(
     )
     tot_inv = sum((r.corrections or {}).get("invented", 0) for r in results)
     log.info(
-        "request summary: %d pages in %.1fs (%.1f s/page avg) | checker edits: %d "
-        "total, %d invented | furniture removed=%d | ocr_model=%s dpi=%d",
+        "request summary: %d pages in %.1fs (%.1f s/page avg) | support edits: %d "
+        "total, %d invented | layout columns=%s | furniture removed=%d | ocr_model=%s dpi=%d",
         len(results),
         total_elapsed,
         total_elapsed / max(1, len(results)),
         tot_edits,
         tot_inv,
+        [r.layout["columns"] if r.layout else None for r in results],
         doc_furniture["removed_total"],
         ocr_model or "default",
         dpi,
@@ -498,9 +607,23 @@ async def parse_image(
     journal = _journal_from_form(journal)
     suffix = Path(file.filename or "x.jpg").suffix.lower() or ".png"
     path = await _save_upload(file, suffix)
+    support = _get_support_engine()
+    # Layout pre-scan on a thumbnail first so the OCR prompt carries the
+    # one-sentence hint (fake mode uses the canned profile).
+    layout: LayoutProfile | None = None
+    if support is not None:
+        thumb = await anyio.to_thread.run_sync(_thumbnail_for_scan, path)
+        try:
+            layout = await _run_layout_scan(support, thumb, 1)
+        finally:
+            thumb.unlink(missing_ok=True)
+    elif holder.is_fake:
+        layout = _fake_layout(1)
     try:
         engine = holder.get_ocr_engine(ocr_model)
-        text, stats, elapsed = await _infer_image_path(path, params, engine)
+        text, stats, elapsed = await _infer_image_path(
+            path, _ocr_params_with_hint(params, layout_hint(layout)), engine
+        )
     except HTTPException:
         raise
     except Exception as exc:
@@ -511,17 +634,17 @@ async def parse_image(
     finally:
         path.unlink(missing_ok=True)
 
-    cleanup = _get_cleanup_engine()
-    cleanup_method = None
-    cleanup_elapsed = None
+    support_method = None
+    support_elapsed = None
     corrections = None
     # Spans are the authoritative output; markdown is derived from them.
     spans = parse_spans(text, page=1)
-    if cleanup is not None:
-        checked, cstats = await _run_span_check(cleanup, spans, None, journal=journal)
+    layout_counts = apply_layout_filter(spans, layout)
+    if support is not None:
+        checked, cstats = await _run_support_check(support, spans, None)
         spans = checked
-        cleanup_method = cstats.method
-        cleanup_elapsed = round(cstats.elapsed_s, 3)
+        support_method = cstats.method
+        support_elapsed = round(cstats.elapsed_s, 3)
         if cstats.audit is not None:
             cstats.audit.log_summary("image")
             corrections = {
@@ -536,13 +659,17 @@ async def parse_image(
             }
     spans_jsonl = spans_to_jsonl(spans)
     text = render_markdown(spans, journal)
+    layout_dict = layout.to_dict() if layout is not None else None
+    if layout_dict is not None:
+        layout_dict.update(layout_counts)
     log.info(
-        "image done: ocr %.1fs (%d tok%s), cleanup %s %.1fs, %d chars",
+        "image done: ocr %.1fs (%d tok%s), layout %s, support %s %.1fs, %d chars",
         elapsed,
         getattr(stats, "tokens", 0) or 0,
         ", early-stop" if getattr(stats, "early_stop", False) else "",
-        cleanup_method or "off",
-        cleanup_elapsed or 0.0,
+        layout.columns if layout is not None else "none",
+        support_method or "off",
+        support_elapsed or 0.0,
         len(text),
     )
 
@@ -558,9 +685,12 @@ async def parse_image(
                 tps=round(getattr(stats, "tps", 0.0) or 0.0, 1) or None,
                 peak_memory_gb=round(getattr(stats, "peak_memory_gb", 0.0) or 0.0, 2) or None,
                 early_stop=bool(getattr(stats, "early_stop", False)),
-                cleanup_method=cleanup_method,
-                cleanup_elapsed_s=cleanup_elapsed,
+                support_method=support_method,
+                support_elapsed_s=support_elapsed,
+                cleanup_method=support_method,
+                cleanup_elapsed_s=support_elapsed,
                 corrections=corrections,
+                layout=layout_dict,
                 spans_jsonl=spans_jsonl,
             )
         ],
@@ -670,13 +800,13 @@ async def job_status(job_id: str) -> JobStatus:
 
 
 # ---------------------------------------------------------------------------
-# Internal reflow endpoint (Paperhub's journal pass over the checker LLM).
+# Internal reflow endpoint (Paperhub's reflow pass over the support LLM).
 #
 # Deliberately NOT public: excluded from the OpenAPI schema and the README.
 # Guarded by BOTH a per-launch bearer token (OCR_INTERNAL_TOKEN, generated
 # by the Tauri sidecar launcher) and a loopback-only check, so it cannot be
 # reached from the LAN even when the server binds 0.0.0.0 for /parse/*.
-# Reflow jobs share infer_limiter with OCR/cleanup: one MLX user at a time.
+# Reflow jobs share infer_limiter with OCR/support: one MLX user at a time.
 # ---------------------------------------------------------------------------
 
 # "testclient" is Starlette's in-process TestClient harness identity.
@@ -724,7 +854,7 @@ async def internal_reflow(body: ReflowRequest, request: Request) -> ReflowRespon
             f"(server speaks {REFLOW_CONTRACT_VERSION}) — bump the pinned "
             "server or the Paperhub client",
         )
-    if holder.is_fake or _get_cleanup_engine() is None:
+    if holder.is_fake or _get_support_engine() is None:
         # Dev contract path: deterministic echo so Paperhub can exercise the
         # full reflow round-trip (auth, version, journal echo) without weights.
         return ReflowResponse(
@@ -737,13 +867,13 @@ async def internal_reflow(body: ReflowRequest, request: Request) -> ReflowRespon
         )
     from functools import partial
 
-    cleanup = _get_cleanup_engine()
-    assert cleanup is not None  # narrowed above; keeps type-checkers honest
+    support = _get_support_engine()
+    assert support is not None  # narrowed above; keeps type-checkers honest
     t0 = time.perf_counter()
     async with infer_limiter:
         text, stats = await anyio.to_thread.run_sync(
             partial(
-                cleanup.reflow_text,
+                support.reflow_text,
                 body.markdown,
                 journal=body.journal,
                 prompt_override=body.prompt_override,
@@ -764,7 +894,7 @@ async def internal_reflow(body: ReflowRequest, request: Request) -> ReflowRespon
         markdown=text,
         method=stats.method,
         elapsed_s=round(time.perf_counter() - t0, 3),
-        model=cleanup.model_ref,
+        model=support.model_ref,
         corrections=_audit_to_corrections(stats.audit),
     )
 

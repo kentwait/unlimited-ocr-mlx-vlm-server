@@ -124,6 +124,21 @@ def test_parse_pdf_all_pages(client):
     assert all(p["markdown"].startswith("MOCK(page-000") for p in body["results"])
 
 
+def test_parse_pdf_fake_layout_profile_present(client):
+    # Fake mode returns the canned layout profile so clients can rely on
+    # the field's shape without weights.
+    r = client.post(
+        "/parse/pdf",
+        files={"file": ("t.pdf", _pdf_bytes(2), "application/pdf")},
+        data={"pages": "all"},
+    )
+    assert r.status_code == 200, r.text
+    for page in r.json()["results"]:
+        assert page["layout"]["columns"] == "1"
+        assert page["layout"]["method"] == "fake-scan"
+        assert page["layout"]["figures"] == []
+
+
 def test_parse_pdf_subset(client):
     r = client.post(
         "/parse/pdf",
@@ -189,33 +204,34 @@ def test_job_unknown_id(client):
     assert r.status_code == 404
 
 
-def test_parse_pdf_rejects_unknown_journal(client):
+def test_parse_pdf_ignores_unknown_journal(client):
+    # Journals are removed: any value is accepted and treated as generic.
     r = client.post(
         "/parse/pdf",
         files={"file": ("t.pdf", _pdf_bytes(1), "application/pdf")},
         data={"pages": "all", "journal": "cell"},
     )
-    assert r.status_code == 400
-    assert "journal" in r.json()["detail"]
+    assert r.status_code == 200, r.text
+    assert r.json()["journal"] == "generic"
 
 
-def test_parse_jobs_rejects_unknown_journal_before_creating(client):
+def test_parse_jobs_accepts_unknown_journal(client):
     r = client.post(
         "/parse/jobs",
         files={"file": ("t.pdf", _pdf_bytes(1), "application/pdf")},
         data={"pages": "all", "journal": "cell"},
     )
-    assert r.status_code == 400
+    assert r.status_code == 202, r.text
 
 
-def test_response_echoes_request_journal(client):
+def test_response_journal_always_generic(client):
     r = client.post(
         "/parse/pdf",
         files={"file": ("t.pdf", _pdf_bytes(1), "application/pdf")},
         data={"pages": "all", "journal": "nature"},
     )
     assert r.status_code == 200, r.text
-    assert r.json()["journal"] == "nature"
+    assert r.json()["journal"] == "generic"
     r = client.post(
         "/parse/pdf",
         files={"file": ("t.pdf", _pdf_bytes(1), "application/pdf")},
@@ -319,14 +335,20 @@ def test_image_http_error_passes_through(client, monkeypatch):
     assert r.json()["detail"] == "bad image"
 
 
-def test_cleanup_engine_disabled_env(monkeypatch):
+def test_support_engine_disabled_env(monkeypatch):
     from ocr_server import api as api_mod
 
     monkeypatch.setattr(api_mod.holder, "is_fake", False)
+    monkeypatch.setenv("OCR_SUPPORT", "0")
+    monkeypatch.setattr(api_mod, "_support_engine", None)
+    assert api_mod._get_support_engine() is None
+    # Deprecated OCR_CLEANUP=0 still disables (fallback path).
+    monkeypatch.delenv("OCR_SUPPORT")
     monkeypatch.setenv("OCR_CLEANUP", "0")
-    monkeypatch.setattr(api_mod, "_cleanup_engine", None)
-    assert api_mod._get_cleanup_engine() is None
-    monkeypatch.setattr(api_mod, "_cleanup_engine", None)
+    monkeypatch.setattr(api_mod, "_support_engine", None)
+    assert api_mod._get_support_engine() is None
+    assert api_mod._get_cleanup_engine() is None  # deprecated alias agrees
+    monkeypatch.setattr(api_mod, "_support_engine", None)
 
 
 def test_prompt_registry_loads_once(client, monkeypatch):

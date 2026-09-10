@@ -6,7 +6,7 @@ import pytest
 
 from ocr_server.api import _audit_to_corrections
 from ocr_server.cleanup import (
-    CleanupEngine,
+    SupportEngine,
     audit_corrections,
     format_fragments,
     parse_numbered_fragments,
@@ -161,6 +161,16 @@ def test_inference_params_validation():
         InferenceParams(prompt="emoji \U0001f600 here")
 
 
+def test_ocr_params_with_hint_appends_or_passes_through():
+    from ocr_server.api import _ocr_params_with_hint
+
+    base = InferenceParams(prompt="document parsing.")
+    assert _ocr_params_with_hint(base, "") is base
+    hinted = _ocr_params_with_hint(base, "Layout: two-column.")
+    assert hinted.prompt == "document parsing. Layout: two-column."
+    assert base.prompt == "document parsing."  # input untouched
+
+
 def test_reflow_request_bounds():
     assert ReflowRequest(markdown="# hi").contract_version == 1
     with pytest.raises(ValueError):
@@ -178,8 +188,12 @@ def test_prompt_registry_loads_repo_prompts():
     reg = PromptRegistry()
     reg.load()
     assert reg.loaded
-    out = reg.render("checker_scan", fragments="[1]\nhi", page=1)
+    out = reg.render("support_scan", fragments="[1]\nhi", page=1)
     assert "[1]" in out and "hi" in out
+    # Pre-rename aliases render the same support templates.
+    assert reg.render("checker_scan", fragments="[1]\nhi", page=1) == out
+    scan = reg.render("layout_scan", page=2)
+    assert "2" in scan and "columns" in scan
     with pytest.raises(RuntimeError):
         reg.render("nope")
 
@@ -188,16 +202,16 @@ def test_prompt_registry_failures(tmp_path):
     reg = PromptRegistry(tmp_path / "missing")
     with pytest.raises(RuntimeError, match="not found"):
         reg.load()
-    tmp_path.joinpath("checker_digital.md").write_text("ok {{ fragments }}")
+    tmp_path.joinpath("support_digital.md").write_text("ok {{ fragments }}")
     with pytest.raises(RuntimeError, match="missing"):
         PromptRegistry(tmp_path).load()
-    tmp_path.joinpath("checker_scan.md").write_text("{% if %}")
+    tmp_path.joinpath("support_scan.md").write_text("{% if %}")
     with pytest.raises(RuntimeError, match="syntax"):
         PromptRegistry(tmp_path).load()
-    tmp_path.joinpath("checker_scan.md").write_text("uses {{ nope }} {{ fragments }}")
+    tmp_path.joinpath("support_scan.md").write_text("uses {{ nope }} {{ fragments }}")
     with pytest.raises(RuntimeError, match="dry-render"):
         PromptRegistry(tmp_path).load()
-    tmp_path.joinpath("checker_scan.md").write_text("   \n  ")
+    tmp_path.joinpath("support_scan.md").write_text("   \n  ")
     with pytest.raises(RuntimeError, match="empty"):
         PromptRegistry(tmp_path).load()
 
@@ -229,15 +243,15 @@ def test_audit_removed_only_edits():
     audit.log_summary("test")  # exercises the no-edit branch
 
 
-def _engine(monkeypatch) -> CleanupEngine:
+def _engine(monkeypatch) -> SupportEngine:
     """Engine with a no-op load and repo prompts (no weights needed)."""
     from ocr_server import cleanup as cleanup_mod
     from ocr_server.prompts import PromptRegistry
 
-    monkeypatch.setattr(cleanup_mod.CleanupEngine, "load", lambda self: None)
+    monkeypatch.setattr(cleanup_mod.SupportEngine, "load", lambda self: None)
     reg = PromptRegistry()
     reg.load()
-    return cleanup_mod.CleanupEngine("stub", prompts=reg)
+    return cleanup_mod.SupportEngine("stub", prompts=reg)
 
 
 def _stub_generate(monkeypatch, output):
@@ -245,7 +259,7 @@ def _stub_generate(monkeypatch, output):
     from ocr_server import cleanup as cleanup_mod
 
     monkeypatch.setattr(
-        cleanup_mod.CleanupEngine,
+        cleanup_mod.SupportEngine,
         "_generate",
         lambda self, prompt, max_tokens: (output, 5, False),
     )
@@ -261,12 +275,12 @@ def _echo_generate(monkeypatch):
 
     from ocr_server import cleanup as cleanup_mod
 
-    monkeypatch.setattr(cleanup_mod.CleanupEngine, "_generate", echo)
+    monkeypatch.setattr(cleanup_mod.SupportEngine, "_generate", echo)
 
 
 def test_cleanup_engine_requires_prompts():
     with pytest.raises(ValueError, match="PromptRegistry"):
-        CleanupEngine("stub", prompts=None)
+        SupportEngine("stub", prompts=None)
 
 
 def test_cleanup_engine_starts_unloaded(monkeypatch):
@@ -274,7 +288,7 @@ def test_cleanup_engine_starts_unloaded(monkeypatch):
 
     reg = PromptRegistry()
     reg.load()
-    assert not CleanupEngine("stub", prompts=reg).loaded
+    assert not SupportEngine("stub", prompts=reg).loaded
 
 
 def test_check_spans_corrects_within_spans(monkeypatch):
@@ -287,7 +301,7 @@ def test_check_spans_corrects_within_spans(monkeypatch):
         Span(page=1, label="text", box=None, id="p1-1", text="teh quick brown fox jumps over the lazy dog here now")
     ]
     checked, stats = engine.check_spans(spans, "the quick brown fox " * 20)
-    assert stats.method == "check-spans-digital"
+    assert stats.method == "support-spans-digital"
     # Identity preserved; only text corrected.
     assert checked[0].id == "p1-1" and checked[0].label == "text"
     assert checked[0].text == "the quick brown fox jumps over the lazy dog here now"
@@ -299,7 +313,7 @@ def test_check_spans_proofread_mode(monkeypatch):
     _echo_generate(monkeypatch)
     spans = [Span(page=2, label="text", box=None, id="p2-1", text="already fine words here")]
     checked, stats = engine.check_spans(spans, None)
-    assert stats.method == "check-spans-proofread"
+    assert stats.method == "support-spans-proofread"
     assert checked[0].text == "already fine words here"
     assert stats.audit is not None and stats.audit.formatting_only
 
@@ -314,7 +328,7 @@ def test_check_spans_skips_structural_and_empty(monkeypatch):
         return "[1]\\nreal content stays", 5, False
 
     from ocr_server import cleanup as cleanup_mod
-    monkeypatch.setattr(cleanup_mod.CleanupEngine, "_generate", spy)
+    monkeypatch.setattr(cleanup_mod.SupportEngine, "_generate", spy)
     spans = [
         Span(page=1, label="header", box=None, id="p1-1", text="SPECIAL SECTION"),
         Span(page=1, label="image", box=None, id="p1-2", text=""),
@@ -335,7 +349,7 @@ def test_check_spans_no_content_spans_skips_llm(monkeypatch):
         raise AssertionError("LLM must not run without content fragments")
 
     from ocr_server import cleanup as cleanup_mod
-    monkeypatch.setattr(cleanup_mod.CleanupEngine, "_generate", boom)
+    monkeypatch.setattr(cleanup_mod.SupportEngine, "_generate", boom)
     spans = [
         Span(page=1, label="header", box=None, id="p1-1", text="SPECIAL SECTION"),
         Span(page=1, label="image", box=None, id="p1-2", text=""),
@@ -343,6 +357,8 @@ def test_check_spans_no_content_spans_skips_llm(monkeypatch):
     checked, stats = engine.check_spans(spans, None)
     assert [s.id for s in checked] == ["p1-1", "p1-2"]
     assert stats.audit is not None and stats.audit.formatting_only
+    # The fallback still names the proofread method (observability).
+    assert stats.method == "support-spans-proofread"
 
 
 def test_check_spans_unparsable_falls_back(monkeypatch):

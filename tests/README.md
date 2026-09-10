@@ -31,10 +31,37 @@ log-call lines excluded (no test asserts log text), weight functions
 carry `# pragma: no mutate block`.
 
 Baseline 2026-09-09: ~1057 killed / 500 survived / 12 suspicious of 1569.
+Baseline 2026-09-10 (layout-support work): 1427 killed / 417 survived /
+13 suspicious of 1857. `layout.py` contributes only 6 survivors, all
+proven-equivalent by direct application (listed above); `scan_layout`
+survivors from the triage pass were killed by prompt/budget/timing pins
+(serial re-runs confirm — parallel verdicts for single mutants have
+flaked before, see the caveat below).
 Triage policy: sample survivors per file, fix cheap assertion gaps
 (unasserted defaults, exact-output checks, load-once behavior), record the
 new baseline here. Do not chase zero — equivalent mutants and
 argparse/logging noise are documented, not fixed.
+
+Layout-support triage 2026-09-10 (`layout.py`, `SupportEngine.scan_layout`):
+two simplifications fell out directly — the `_clean_box` inversion check
+(subsumed by the size floor) and strict type/branch coverage became exact
+profile assertions, boundary tests (inset edges, confidence/size
+thresholds), count assertions (no `= 1` vs `+= 1` slips), idempotence
+(pre-labeled spans never recounted), and vision-plumbing pins (prompt
+carries the page, 384-token budget, elapsed timing). Proven-equivalent,
+kept as documentation: brace-slice non-dict guard (unreachable —
+`# pragma: no cover`), `figures` default and dict-without-box defaults
+(same outcome downstream), int-column `and`/`or` (both paths reject),
+`check_spans` empty-spans page default (unused on that path), and the
+`or`→`and` precedence guard (the band check subsumes it). The vestigial
+`check_spans(journal=)` parameter was deleted outright after mutation
+showed the argument no longer affects the drop set.
+
+Caveat (observed 2026-09-10): parallel `--max-children` runs can
+misreport verdicts — a layout mutant reported as survived died on an
+isolated serial re-run. Backstop: re-run suspect mutants by name
+(`mutmut run <name>`) before chasing them; record serial-confirmed
+baselines only.
 
 Workflow: `make mutate` (resumable via `.mutmut-cache/`), then
 `mutmut results` and `mutmut show <name>` per file; re-run from a clean

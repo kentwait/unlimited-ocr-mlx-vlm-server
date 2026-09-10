@@ -28,8 +28,13 @@ PROMPTS_DIR = Path(__file__).resolve().parents[2] / "prompts"
 
 # name -> (filename, required context keys)
 TEMPLATE_SPECS = {
-    "checker_digital": ("checker_digital.md", {"fragments", "text_layer", "page"}),
-    "checker_scan": ("checker_scan.md", {"fragments", "page"}),
+    "support_digital": ("support_digital.md", {"fragments", "text_layer", "page"}),
+    "support_scan": ("support_scan.md", {"fragments", "page"}),
+    # Pre-rename aliases: an operator's OCR_PROMPTS_DIR may still carry
+    # checker_*.md files; both names render the same support template.
+    "checker_digital": ("support_digital.md", {"fragments", "text_layer", "page"}),
+    "checker_scan": ("support_scan.md", {"fragments", "page"}),
+    "layout_scan": ("layout_scan.md", {"page"}),
 }
 
 

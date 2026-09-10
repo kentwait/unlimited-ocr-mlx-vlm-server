@@ -44,10 +44,16 @@ class PageResult(BaseModel):
     tps: float | None = None
     peak_memory_gb: float | None = None
     early_stop: bool = False  # generation loop detected and truncated
-    cleanup_method: str | None = None  # "ocr+pymupdf+llm" | "ocr-llm-proofread" | "ocr-only"
-    cleanup_elapsed_s: float | None = None
-    cleanup_early_stop: bool | None = None
-    corrections: dict | None = None  # checker edit counts + samples (see audit_corrections)
+    # Support stage (renamed from cleanup/*; the old fields are dual-written
+    # for one release so older clients keep working, then removed).
+    support_method: str | None = None  # "support-spans-digital" | "support-spans-proofread"
+    support_elapsed_s: float | None = None
+    support_early_stop: bool | None = None
+    cleanup_method: str | None = None  # deprecated alias of support_method
+    cleanup_elapsed_s: float | None = None  # deprecated alias
+    cleanup_early_stop: bool | None = None  # deprecated alias
+    corrections: dict | None = None  # support-model edit counts + samples (see audit_corrections)
+    layout: dict | None = None  # coarse pre-scan profile (see LayoutProfile.to_dict); None when skipped/failed
     spans_jsonl: str | None = None  # structured OCR spans: {"page", "label", "box", "text"} per line
 
 
@@ -57,7 +63,7 @@ class DocumentParseResponse(BaseModel):
     results: list[PageResult]
     total_elapsed_s: float
     furniture: dict | None = None  # {template, removed_total, removed_by_page, samples}
-    journal: str = "generic"  # render policy applied; echoes the request journal
+    journal: str = "generic"  # deprecated: always "generic"; per-document layout now comes from the pre-scan
 
 
 class HealthResponse(BaseModel):
@@ -80,7 +86,9 @@ class JobStatus(BaseModel):
     finished_at: float | None = None
     # Client-facing progress (UI polls this): current pipeline phase and
     # per-page counts. pages_total is None until the pages spec is parsed.
-    phase: str | None = None  # "ocr" | "cleanup"
+    # The layout pre-scan runs inside the "ocr" phase (it is fast and page
+    # local); the support correction pass reports phase "support".
+    phase: str | None = None  # "ocr" | "support"
     pages_done: int = 0
     pages_total: int | None = None
 

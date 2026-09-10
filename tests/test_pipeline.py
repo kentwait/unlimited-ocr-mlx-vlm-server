@@ -36,7 +36,15 @@ def _canonical_output(self, prompt, max_tokens):
 
 @pytest.fixture()
 def stubbed_llm(monkeypatch):
-    monkeypatch.setattr(cleanup_mod.CleanupEngine, "load", lambda self: None)
+    monkeypatch.setattr(cleanup_mod.SupportEngine, "load", lambda self: None)
+    # Canned 2-column profile: exercises hint injection + filter plumbing
+    # without weights (filter no-ops on box-less MOCK spans).
+    from ocr_server.layout import LayoutProfile
+
+    def _canned_scan(self, image_path, page, max_tokens=384):
+        return LayoutProfile(page=page, columns="2", confidence=0.9)
+
+    monkeypatch.setattr(cleanup_mod.SupportEngine, "scan_layout", _canned_scan)
     yield
 
 
@@ -48,20 +56,40 @@ def client(monkeypatch, stubbed_llm):
     with TestClient(app) as c:
         # Lifespan re-loads the holder on entry: flip to the stubbed-LLM
         # configuration only after it runs.
-        monkeypatch.setattr(api_mod, "_cleanup_engine", None)
+        monkeypatch.setattr(api_mod, "_support_engine", None)
         holder.is_fake = False
         holder.engine = FakeEngine()
         holder.engine.load()
         yield c
     holder.engine = None
     holder.is_fake = False
-    monkeypatch.setattr(api_mod, "_cleanup_engine", None)
+    monkeypatch.setattr(api_mod, "_support_engine", None)
 
 
-def test_pdf_pipeline_with_cleanup(client, monkeypatch):
-    # Checker echoes fragments: corrected spans == original spans, so the
+def test_pdf_pipeline_support_disabled_runs_unhinted(client, monkeypatch):
+    # OCR_SUPPORT=0: no pre-scan (layout None), no correction — the raw
+    # OCR text renders verbatim.
+    monkeypatch.setenv("OCR_SUPPORT", "0")
+    monkeypatch.setattr(api_mod, "_support_engine", None)
+    try:
+        r = client.post(
+            "/parse/pdf",
+            files={"file": ("t.pdf", _pdf_bytes(1), "application/pdf")},
+            data={"pages": "all"},
+        )
+        assert r.status_code == 200, r.text
+        page = r.json()["results"][0]
+        assert page["markdown"] == "MOCK(page-0001.png|document parsing.)"
+        assert page["layout"] is None
+        assert page["support_method"] is None
+    finally:
+        monkeypatch.setattr(api_mod, "_support_engine", None)
+
+
+def test_pdf_pipeline_with_support(client, monkeypatch):
+    # Support echoes fragments: corrected spans == original spans, so the
     # markdown must be exactly the deterministic render of those spans.
-    monkeypatch.setattr(cleanup_mod.CleanupEngine, "_generate", _echo_fragments)
+    monkeypatch.setattr(cleanup_mod.SupportEngine, "_generate", _echo_fragments)
     r = client.post(
         "/parse/pdf",
         files={"file": ("t.pdf", _pdf_bytes(2), "application/pdf")},
@@ -71,8 +99,11 @@ def test_pdf_pipeline_with_cleanup(client, monkeypatch):
     body = r.json()
     assert body["n_pages"] == 2
     page = body["results"][0]
-    assert page["markdown"] == "MOCK(page-0001.png|document parsing.)"
-    assert page["cleanup_method"] == "check-spans-proofread"
+    assert page["markdown"].startswith("MOCK(page-0001.png|document parsing. Layout:")
+    assert "two-column" in page["markdown"]
+    assert page["layout"]["columns"] == "2"
+    assert page["support_method"] == "support-spans-proofread"
+    assert page["cleanup_method"] == "support-spans-proofread"
     assert page["corrections"]["formatting_only"] is True
     assert body["furniture"]["template"] is None
     # Spans are the authoritative output and carry identity.
@@ -80,15 +111,15 @@ def test_pdf_pipeline_with_cleanup(client, monkeypatch):
 
     spans = [_json.loads(line) for line in page["spans_jsonl"].splitlines()]
     assert spans[0]["id"] == "p1-1"
-    assert spans[0]["text"] == "MOCK(page-0001.png|document parsing.)"
+    assert spans[0]["text"].startswith("MOCK(page-0001.png|document parsing.")
 
 
-def test_pdf_pipeline_applies_checker_corrections(client, monkeypatch):
+def test_pdf_pipeline_applies_support_corrections(client, monkeypatch):
     def fix_typo(self, prompt, max_tokens):
         block = _echo_fragments(self, prompt, max_tokens)[0]
         return block.replace("MOCK", "MARK"), 5, False
 
-    monkeypatch.setattr(cleanup_mod.CleanupEngine, "_generate", fix_typo)
+    monkeypatch.setattr(cleanup_mod.SupportEngine, "_generate", fix_typo)
     r = client.post(
         "/parse/pdf",
         files={"file": ("t.pdf", _pdf_bytes(1), "application/pdf")},
@@ -106,18 +137,18 @@ def test_pdf_pipeline_applies_checker_corrections(client, monkeypatch):
 
 
 def test_image_pipeline_with_cleanup(client, monkeypatch):
-    monkeypatch.setattr(cleanup_mod.CleanupEngine, "_generate", _echo_fragments)
+    monkeypatch.setattr(cleanup_mod.SupportEngine, "_generate", _echo_fragments)
     r = client.post(
         "/parse/image",
         files={"file": ("t.png", _png_bytes(), "image/png")},
     )
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["results"][0]["cleanup_method"] == "check-spans-proofread"
+    assert body["results"][0]["support_method"] == "support-spans-proofread"
 
 
 def test_reflow_real_path_with_audit(client, monkeypatch):
-    monkeypatch.setattr(cleanup_mod.CleanupEngine, "_generate", _canonical_output)
+    monkeypatch.setattr(cleanup_mod.SupportEngine, "_generate", _canonical_output)
     r = client.post(
         "/internal/reflow",
         json={
@@ -188,8 +219,8 @@ def test_oversize_upload_rejected(client, monkeypatch):
     assert r.status_code == 413
 
 
-def test_job_flow_with_cleanup_tracks_phase(client, monkeypatch):
-    monkeypatch.setattr(cleanup_mod.CleanupEngine, "_generate", _echo_fragments)
+def test_job_flow_with_support_tracks_phase(client, monkeypatch):
+    monkeypatch.setattr(cleanup_mod.SupportEngine, "_generate", _echo_fragments)
     r = client.post(
         "/parse/jobs",
         files={"file": ("t.pdf", _pdf_bytes(2), "application/pdf")},
@@ -204,7 +235,7 @@ def test_job_flow_with_cleanup_tracks_phase(client, monkeypatch):
         time.sleep(0.05)
     body = s.json()
     assert body["status"] == "done", body
-    assert body["result"]["results"][0]["cleanup_method"] == "check-spans-proofread"
+    assert body["result"]["results"][0]["cleanup_method"] == "support-spans-proofread"
 
 
 def test_infer_defaults_to_holder_engine(client, tmp_path):
@@ -242,11 +273,11 @@ def test_parse_pdf_path_rejects_bad_furniture(client, tmp_path):
         )
 
 
-def test_parse_pdf_path_tracks_cleanup_progress(client, tmp_path, monkeypatch):
+def test_parse_pdf_path_tracks_support_progress(client, tmp_path, monkeypatch):
     import asyncio
     import time
 
-    monkeypatch.setattr(cleanup_mod.CleanupEngine, "_generate", _echo_fragments)
+    monkeypatch.setattr(cleanup_mod.SupportEngine, "_generate", _echo_fragments)
 
     from ocr_server.schemas import InferenceParams, JobStatus
 
@@ -259,12 +290,11 @@ def test_parse_pdf_path_tracks_cleanup_progress(client, tmp_path, monkeypatch):
             pages="all",
             dpi=100,
             params=InferenceParams(prompt="document parsing."),
-            journal="nature",
             job=job,
         )
     )
-    assert resp.journal == "nature"
-    assert job.phase == "cleanup"
+    assert resp.journal == "generic"
+    assert job.phase == "support"
     assert job.pages_total == 2
     # Fresh per-stage count: every page checked, none beyond the total.
     assert job.pages_done == 2

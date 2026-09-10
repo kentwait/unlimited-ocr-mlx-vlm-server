@@ -24,10 +24,24 @@ def main() -> None:
         default=os.environ.get("OCR_LAYOUT_MODEL", ""),
         help="Path to a PP-DocLayout-S ONNX file (defaults to the vendored model)",
     )
+    parser.add_argument(
+        "--assistant-model",
+        default=os.environ.get("OCR_ASSISTANT_MODEL", ""),
+        help="Override the pinned assistant model reference (development only)",
+    )
+    parser.add_argument(
+        "--assistant-fake",
+        action="store_true",
+        help="Serve a deterministic fake assistant (CI, UI development)",
+    )
     args = parser.parse_args()
 
     if args.layout_model:
         os.environ["OCR_LAYOUT_MODEL"] = args.layout_model
+    if args.assistant_model:
+        os.environ["OCR_ASSISTANT_MODEL"] = args.assistant_model
+    if args.assistant_fake:
+        os.environ["OCR_ASSISTANT_FAKE"] = "1"
 
     uvicorn.run(
         "ocr_server.api:app",

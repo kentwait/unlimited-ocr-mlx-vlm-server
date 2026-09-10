@@ -18,6 +18,7 @@ from pathlib import Path
 import anyio
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 
+from .assistant_api import router as assistant_router
 from .pipeline import DEFAULT_FIGURE_DPI, parse_pdf as run_parse_pdf
 from .pp_layout import LayoutModel
 from .schemas import DocumentParseResponse, HealthResponse, JobStatus
@@ -89,6 +90,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Local assistant: model lifecycle + OpenAI-compatible chat surface. The
+# runtime itself is optional (the parse server works without MLX installed).
+app.include_router(assistant_router)
 
 
 async def _save_upload(upload: UploadFile) -> Path:
@@ -208,5 +213,12 @@ async def job_status(job_id: str) -> JobStatus:
 async def root() -> dict:
     return {
         "service": "paperhub-parser",
-        "endpoints": ["/health", "/parse/pdf", "/parse/jobs"],
+        "endpoints": [
+            "/health",
+            "/parse/pdf",
+            "/parse/jobs",
+            "/assistant/status",
+            "/assistant/model/download",
+            "/v1/chat/completions",
+        ],
     }

@@ -49,7 +49,14 @@ def test_health(client):
 def test_root_lists_endpoints(client):
     body = client.get("/").json()
     assert body["service"] == "paperhub-parser"
-    assert set(body["endpoints"]) == {"/health", "/parse/pdf", "/parse/jobs"}
+    assert set(body["endpoints"]) == {
+        "/health",
+        "/parse/pdf",
+        "/parse/jobs",
+        "/assistant/status",
+        "/assistant/model/download",
+        "/v1/chat/completions",
+    }
 
 
 def test_removed_endpoints_are_gone(client):

@@ -1,636 +1,406 @@
-"""Unit tests for pure helpers: no model, no server, no weights."""
+"""Unit tests: spans, pages, rendering, boxes, crops, region filtering, merge."""
 
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
+
+import pymupdf
 import pytest
 
-from ocr_server.api import _audit_to_corrections
-from ocr_server.cleanup import (
-    CleanupEngine,
-    audit_corrections,
-    format_fragments,
-    parse_numbered_fragments,
+from ocr_server import spans as spans_mod
+from ocr_server.figures import DATA_URI_PREFIX, crop_data_uri
+from ocr_server.native_layout import (
+    FIGURE_CONTAINABLE,
+    LABEL_MAP,
+    NativeBox,
+    _box_text,
+    missing_text_pages,
+    normalize_box,
 )
-from ocr_server.engine import (
-    OcrEngine,
-    _dedupe_long_lines,
-    _loop_period,
-    decode_byte_level,
-)
-from ocr_server.furniture import _apply_generic, apply_furniture
 from ocr_server.pages import parse_pages_spec
-from ocr_server.prompts import PromptRegistry
-from ocr_server.schemas import InferenceParams, ReflowRequest
-from ocr_server.spans import (
-    Span,
-    parse_spans,
-    render_markdown,
-    spans_to_jsonl,
+from ocr_server.pdfrender import render_pdf_pages
+from ocr_server.pipeline import (
+    _center_inside,
+    _figure_span,
+    _iou,
+    _picture_matches,
+    merge_page,
+    select_figures,
 )
+from ocr_server.pp_layout import (
+    CAPTURE_CLASSES,
+    DEDUPE_IOU,
+    MAX_AREA_SHARE,
+    MIN_DIM,
+    SCORE_MIN,
+    FigureRegion,
+    _clamp_box,
+    clean_regions,
+)
+from ocr_server.spans import Span, assign_ids, spans_to_jsonl
+
+from conftest import PDF_PATH, make_image_pdf, make_text_pdf
+
+
+# ---------- pages spec ----------
+
+
+def test_pages_specs():
+    assert parse_pages_spec(None, 5) == [1, 2, 3, 4, 5]
+    assert parse_pages_spec("all", 2) == [1, 2]
+    assert parse_pages_spec("1-3,5", 5) == [1, 2, 3, 5]
+    assert parse_pages_spec("3,1,3", 5) == [1, 3]
+    with pytest.raises(ValueError, match="out of range"):
+        parse_pages_spec("1-3,9", 5)
+    with pytest.raises(ValueError, match="invalid page spec"):
+        parse_pages_spec("abc", 5)
+    with pytest.raises(ValueError, match="invalid page range"):
+        parse_pages_spec("5-2", 5)
+    with pytest.raises(ValueError, match="empty pages spec"):
+        parse_pages_spec(",", 5)
+    with pytest.raises(ValueError, match="no pages"):
+        parse_pages_spec("all", 0)
+
+
+# ---------- rendering ----------
+
+
+def test_render_pdf_pages(tmp_path):
+    doc = pymupdf.open(stream=make_text_pdf(3), filetype="pdf")
+    paths = render_pdf_pages(doc, [1, 3], 100, tmp_path)
+    assert [p.name for p in paths] == ["page-0001.png", "page-0003.png"]
+    assert all(p.stat().st_size > 0 for p in paths)
+    doc.close()
 
 
 # ---------- spans ----------
 
 
-def test_parse_spans_markers_gaps_and_tail():
-    text = (
-        "leading plain\n"
-        "<|det|>title [0, 0, 100, 10]<|/det|>My Title\n"
-        "<|det|>text [0, 20, 50, 30]<|/det|>Body here<PAGE>\n"
-        "trailing plain"
-    )
-    spans = parse_spans(text, page=2)
-    # Gap text becomes a plain record; trailing text joins the last span —
-    # content is preserved, never dropped.
-    assert [(s.label, s.page) for s in spans] == [
-        ("text", 2),
-        ("title", 2),
-        ("text", 2),
+def test_span_to_dict_omits_none_image():
+    span = Span(page=1, label="text", box=[0, 0, 10, 10], text="hi")
+    assert span.to_dict() == {
+        "id": "",
+        "page": 1,
+        "label": "text",
+        "box": [0, 0, 10, 10],
+        "text": "hi",
+    }
+
+
+def test_span_to_dict_includes_image():
+    span = Span(page=2, label="image", box=None, text="", image="data:image/png;base64,x")
+    data = span.to_dict()
+    assert data["image"] == "data:image/png;base64,x"
+    assert data["box"] is None
+
+
+def test_assign_ids_per_page_and_preserves_order():
+    items = [
+        Span(page=2, label="text", box=None, text="a"),
+        Span(page=1, label="text", box=None, text="b"),
+        Span(page=2, label="text", box=None, text="c"),
     ]
-    assert spans[1].box == [0, 0, 100, 10]
-    assert spans[2].text == "Body here\ntrailing plain"  # <PAGE> stripped
-    assert spans[0].box is None  # gap record
+    assign_ids(items)
+    assert [s.id for s in items] == ["p2-1", "p1-1", "p2-2"]
 
 
-def test_parse_spans_empty_and_plain():
-    assert parse_spans("") == []
-    assert parse_spans("   ") == []
-    spans = parse_spans("just words")
-    assert len(spans) == 1 and spans[0].text == "just words"
-    assert spans[0].label == "text" and spans[0].page == 1  # defaults pinned
-
-
-def test_parse_spans_empty_marker_label_falls_back():
-    spans = parse_spans("<|det|>  [0,0,1,1]<|/det|>x")
-    assert spans[0].label == "text"
-
-
-def test_parse_spans_assigns_stable_ids():
-    spans = parse_spans("<|det|>title [0,0,1,1]<|/det|>T<|det|>text [0,2,3,4]<|/det|>B", page=3)
-    assert [s.id for s in spans] == ["p3-1", "p3-2"]
-    # Page-scoped: same layout on another page renumbers by page.
-    assert parse_spans("<|det|>text [0,2,3,4]<|/det|>B", page=3)[0].id == "p3-1"
-
-
-def test_spans_jsonl_round_trip():
-    spans = parse_spans("<|det|>title [0, 0, 1, 1]<|/det|>T", page=1)
-    assert spans[0].to_dict()["text"] == "T"
-    line = spans_to_jsonl(spans)
-    assert '"page": 1' in line and '"id": "p1-1"' in line
-
-
-def test_render_markdown_skips_furniture_and_figures():
+def test_spans_to_jsonl_round_trip():
     spans = [
-        Span(page=1, label="title", box=None, text="T"),
-        Span(page=1, label="furniture", box=None, text="running head"),
-        Span(page=1, label="image", box=None, text=""),
-        Span(page=1, label="text", box=None, text="body"),
-        Span(page=1, label="text", box=None, text="  "),
+        Span(page=1, label="title", box=[0, 0, 10, 10], text="T", id="p1-1"),
+        Span(page=1, label="image", box=[0, 0, 5, 5], text="", id="p1-2", image="x"),
     ]
-    assert render_markdown(spans) == "# T\n\n*[figure]*\n\nbody"
-
-
-def test_render_markdown_skips_page_duplicates():
-    page = Span(page=1, label="page", box=[0, 0, 1000, 1000], text="whole page")
-    title = Span(page=1, label="title", box=None, text="T")
-    assert render_markdown([page, title]) == "# T"
-    # Page-only output keeps its text: never silently drop content.
-    assert render_markdown([page]) == "whole page"
-
-
-def test_render_markdown_drops_structural_labels_per_journal():
-    from ocr_server.spans import JOURNALS, drop_labels_for
-
-    assert set(JOURNALS) == {"generic", "nature", "science", "pmc"}
-    header = Span(page=1, label="header", box=None, text="SPECIAL SECTION")
-    footer = Span(page=1, label="footer", box=None, text="journal boilerplate")
-    pagenum = Span(page=1, label="page_number", box=None, text="12")
-    aside = Span(page=1, label="aside_text", box=None, text="Downloaded from x")
-    affil = Span(page=1, label="page_footnote", box=None, text="Dept of X")
-    body = Span(page=1, label="text", box=None, text="real content here")
-    for journal in JOURNALS:
-        assert drop_labels_for(journal) >= {
-            "header",
-            "footer",
-            "page_number",
-            "aside_text",
-            "page_footnote",
-        }
-        assert render_markdown([header, footer, pagenum, aside, affil, body], journal) == (
-            "real content here"
-        )
-    # Unknown journals fall back to the universal set, never to nothing.
-    assert "header" in drop_labels_for("cell")
-
+    lines = spans_to_jsonl(spans).splitlines()
+    parsed = [json.loads(line) for line in lines]
+    assert parsed[0]["label"] == "title"
+    assert "image" not in parsed[0]
+    assert parsed[1]["image"] == "x"
+    assert spans_mod.spans_to_jsonl([]) == ""
 
-def test_content_words_drops_shorts_and_digits():
-    from ocr_server.cleanup import _content_words
-
-    assert _content_words("answer 42 x") == ["answer"]
-
-
-# ---------- pages ----------
 
+# ---------- native layout ----------
 
-def test_pages_spec_edges():
-    assert parse_pages_spec("", 3) == [1, 2, 3]
-    assert parse_pages_spec("*", 2) == [1, 2]
-    assert parse_pages_spec("2,2,1", 3) == [1, 2]
-    assert parse_pages_spec("1,,2", 3) == [1, 2]
-    assert parse_pages_spec(" 2 - 3 ", 3) == [2, 3]
-    with pytest.raises(ValueError):
-        parse_pages_spec("all", 0)
-    with pytest.raises(ValueError):
-        parse_pages_spec("0", 3)
-    with pytest.raises(ValueError):
-        parse_pages_spec("3-1", 5)
-    with pytest.raises(ValueError):
-        parse_pages_spec(",,,", 5)
 
+def test_normalize_box_scales_and_repairs_inversion():
+    assert normalize_box([594, 756, 0, 0], 594, 756) == [0, 0, 1000, 1000]
+    assert normalize_box([59.4, 75.6, 297, 378], 594, 756) == [100, 100, 500, 500]
 
-# ---------- schemas ----------
-
 
-def test_inference_params_validation():
-    assert InferenceParams().prompt == "document parsing."
-    with pytest.raises(ValueError):
-        InferenceParams(prompt="   ")
-    with pytest.raises(ValueError):
-        InferenceParams(prompt="x" * 201)
-    with pytest.raises(ValueError):
-        InferenceParams(prompt="emoji \U0001f600 here")
+def test_normalize_box_clamps_out_of_range_and_degenerate_pages():
+    assert normalize_box([-10, -10, 700, 900], 594, 756) == [0, 0, 1000, 1000]
+    assert normalize_box([1, 2, 3, 4], 0, 756) == [0, 0, 0, 0]
+    assert normalize_box([1, 2, 3, 4], 594, 0) == [0, 0, 0, 0]
 
 
-def test_reflow_request_bounds():
-    assert ReflowRequest(markdown="# hi").contract_version == 1
-    with pytest.raises(ValueError):
-        ReflowRequest(markdown="  ")
-    with pytest.raises(ValueError):
-        ReflowRequest(markdown="# hi", journal="j" * 65)
-    with pytest.raises(ValueError):
-        ReflowRequest(markdown="# hi", max_tokens=10**9)
+def test_box_text_joins_spans_across_lines():
+    box = {
+        "textlines": [
+            {"spans": [{"text": "Hello"}, {"text": "world"}]},
+            {"spans": [{"text": "again"}]},
+            {"spans": []},
+        ]
+    }
+    assert _box_text(box) == "Hello world again"
 
 
-# ---------- prompts ----------
+def test_box_text_handles_missing_keys():
+    assert _box_text({}) == ""
+    assert _box_text({"textlines": None}) == ""
 
 
-def test_prompt_registry_loads_repo_prompts():
-    reg = PromptRegistry()
-    reg.load()
-    assert reg.loaded
-    out = reg.render("checker_scan", fragments="[1]\nhi", page=1)
-    assert "[1]" in out and "hi" in out
-    with pytest.raises(RuntimeError):
-        reg.render("nope")
+def test_label_map_covers_known_classes():
+    assert LABEL_MAP["section-header"] == "title"
+    assert LABEL_MAP["page-header"] == "header"
+    assert LABEL_MAP["page-footer"] == "footer"
+    assert LABEL_MAP["picture"] == "picture"
+    assert FIGURE_CONTAINABLE == {"text", "list-item"}
 
 
-def test_prompt_registry_failures(tmp_path):
-    reg = PromptRegistry(tmp_path / "missing")
-    with pytest.raises(RuntimeError, match="not found"):
-        reg.load()
-    tmp_path.joinpath("checker_digital.md").write_text("ok {{ fragments }}")
-    with pytest.raises(RuntimeError, match="missing"):
-        PromptRegistry(tmp_path).load()
-    tmp_path.joinpath("checker_scan.md").write_text("{% if %}")
-    with pytest.raises(RuntimeError, match="syntax"):
-        PromptRegistry(tmp_path).load()
-    tmp_path.joinpath("checker_scan.md").write_text("uses {{ nope }} {{ fragments }}")
-    with pytest.raises(RuntimeError, match="dry-render"):
-        PromptRegistry(tmp_path).load()
-    tmp_path.joinpath("checker_scan.md").write_text("   \n  ")
-    with pytest.raises(RuntimeError, match="empty"):
-        PromptRegistry(tmp_path).load()
+def test_missing_text_pages_detects_scans():
+    image_doc = pymupdf.open(stream=make_image_pdf(), filetype="pdf")
+    assert missing_text_pages(image_doc, [1]) == [1]
+    image_doc.close()
+    text_doc = pymupdf.open(stream=make_text_pdf(2), filetype="pdf")
+    assert missing_text_pages(text_doc, [1, 2]) == []
+    text_doc.close()
 
 
-# ---------- cleanup pure helpers ----------
+# ---------- figure crops ----------
 
 
-def test_audit_corrections_attribution():
-    audit = audit_corrections("the cat sat", "the dog sat", "a dog runs")
-    assert audit.text_layer_backed == ["dog"]
-    assert audit.invented == []
-    assert not audit.formatting_only
+@pytest.fixture(scope="module")
+def page_render(tmp_path_factory) -> Path:
+    out = tmp_path_factory.mktemp("render")
+    doc = pymupdf.open(PDF_PATH)
+    path = render_pdf_pages(doc, [1], 150, out)[0]
+    doc.close()
+    return path
 
 
-def test_audit_corrections_ocr_vocab_backed():
-    audit = audit_corrections("cat sat", "cat cat", None)
-    assert audit.ocr_vocab_backed == ["cat"]
-    assert audit.invented == []
+def test_crop_data_uri_returns_png_payload(page_render):
+    uri = crop_data_uri(page_render, [60, 600, 640, 880])
+    assert uri is not None
+    assert uri.startswith(DATA_URI_PREFIX)
+    import base64
 
+    payload = base64.b64decode(uri.split(",", 1)[1])
+    assert payload.startswith(b"\x89PNG")
 
-def test_audit_to_corrections_none():
-    assert _audit_to_corrections(None) is None
 
+def test_crop_data_uri_degenerate_box_is_none(page_render):
+    assert crop_data_uri(page_render, [10, 10, 10, 10]) is None
+    assert crop_data_uri(page_render, [900, 900, 10, 10]) is None
 
-def test_audit_removed_only_edits():
-    audit = audit_corrections("alpha beta", "alpha", None)
-    assert not audit.formatting_only
-    assert audit.n_edits == 0
-    audit.log_summary("test")  # exercises the no-edit branch
 
+def test_crop_data_uri_unreadable_path_is_none(tmp_path):
+    bad = tmp_path / "bad.png"
+    bad.write_text("not an image")
+    assert crop_data_uri(bad, [0, 0, 100, 100]) is None
+    assert crop_data_uri(tmp_path / "missing.png", [0, 0, 100, 100]) is None
 
-def _engine(monkeypatch) -> CleanupEngine:
-    """Engine with a no-op load and repo prompts (no weights needed)."""
-    from ocr_server import cleanup as cleanup_mod
-    from ocr_server.prompts import PromptRegistry
 
-    monkeypatch.setattr(cleanup_mod.CleanupEngine, "load", lambda self: None)
-    reg = PromptRegistry()
-    reg.load()
-    return cleanup_mod.CleanupEngine("stub", prompts=reg)
+def test_crop_data_uri_downscales_large_crops(page_render, monkeypatch):
+    from PIL import Image
 
+    import ocr_server.figures as figures
 
-def _stub_generate(monkeypatch, output):
-    """Stub the raw LLM output (the full numbered-fragment block)."""
-    from ocr_server import cleanup as cleanup_mod
-
-    monkeypatch.setattr(
-        cleanup_mod.CleanupEngine,
-        "_generate",
-        lambda self, prompt, max_tokens: (output, 5, False),
-    )
-
-
-def _echo_generate(monkeypatch):
-    """Stub that echoes the numbered fragments back unchanged."""
-
-    def echo(self, prompt, max_tokens):
-        start = prompt.index("<<<FRAGMENTS") + len("<<<FRAGMENTS\n")
-        end = prompt.index("FRAGMENTS>>>")
-        return prompt[start:end].strip(), 5, False
-
-    from ocr_server import cleanup as cleanup_mod
-
-    monkeypatch.setattr(cleanup_mod.CleanupEngine, "_generate", echo)
-
-
-def test_cleanup_engine_requires_prompts():
-    with pytest.raises(ValueError, match="PromptRegistry"):
-        CleanupEngine("stub", prompts=None)
-
-
-def test_cleanup_engine_starts_unloaded(monkeypatch):
-    from ocr_server.prompts import PromptRegistry
-
-    reg = PromptRegistry()
-    reg.load()
-    assert not CleanupEngine("stub", prompts=reg).loaded
-
-
-def test_check_spans_corrects_within_spans(monkeypatch):
-    engine = _engine(monkeypatch)
-    _stub_generate(
-        monkeypatch,
-        "[1]\nthe quick brown fox jumps over the lazy dog here now",
-    )
-    spans = [
-        Span(page=1, label="text", box=None, id="p1-1", text="teh quick brown fox jumps over the lazy dog here now")
-    ]
-    checked, stats = engine.check_spans(spans, "the quick brown fox " * 20)
-    assert stats.method == "check-spans-digital"
-    # Identity preserved; only text corrected.
-    assert checked[0].id == "p1-1" and checked[0].label == "text"
-    assert checked[0].text == "the quick brown fox jumps over the lazy dog here now"
-    assert stats.audit is not None and stats.audit.text_layer_backed == ["the"]
-
-
-def test_check_spans_proofread_mode(monkeypatch):
-    engine = _engine(monkeypatch)
-    _echo_generate(monkeypatch)
-    spans = [Span(page=2, label="text", box=None, id="p2-1", text="already fine words here")]
-    checked, stats = engine.check_spans(spans, None)
-    assert stats.method == "check-spans-proofread"
-    assert checked[0].text == "already fine words here"
-    assert stats.audit is not None and stats.audit.formatting_only
-
-
-def test_check_spans_skips_structural_and_empty(monkeypatch):
-    engine = _engine(monkeypatch)
-    seen = {}
-
-    def spy(self, prompt, max_tokens):
-        seen["prompt"] = prompt
-        # Echo back only the one content fragment the engine should send.
-        return "[1]\\nreal content stays", 5, False
-
-    from ocr_server import cleanup as cleanup_mod
-    monkeypatch.setattr(cleanup_mod.CleanupEngine, "_generate", spy)
-    spans = [
-        Span(page=1, label="header", box=None, id="p1-1", text="SPECIAL SECTION"),
-        Span(page=1, label="image", box=None, id="p1-2", text=""),
-        Span(page=1, label="text", box=None, id="p1-3", text="real content stays"),
-    ]
-    checked, _ = engine.check_spans(spans, None)
-    assert "SPECIAL SECTION" not in seen["prompt"]
-    assert seen["prompt"].count("[1]") == 1
-    # Identity: structural and image spans untouched, all ids preserved.
-    assert [s.id for s in checked] == ["p1-1", "p1-2", "p1-3"]
-    assert checked[0].text == "SPECIAL SECTION" and checked[1].text == ""
-
-
-def test_check_spans_no_content_spans_skips_llm(monkeypatch):
-    engine = _engine(monkeypatch)
-
-    def boom(self, prompt, max_tokens):
-        raise AssertionError("LLM must not run without content fragments")
-
-    from ocr_server import cleanup as cleanup_mod
-    monkeypatch.setattr(cleanup_mod.CleanupEngine, "_generate", boom)
-    spans = [
-        Span(page=1, label="header", box=None, id="p1-1", text="SPECIAL SECTION"),
-        Span(page=1, label="image", box=None, id="p1-2", text=""),
-    ]
-    checked, stats = engine.check_spans(spans, None)
-    assert [s.id for s in checked] == ["p1-1", "p1-2"]
-    assert stats.audit is not None and stats.audit.formatting_only
-
-
-def test_check_spans_unparsable_falls_back(monkeypatch):
-    engine = _engine(monkeypatch)
-    _stub_generate(monkeypatch, "I cannot follow the numbered format, sorry.")
-    spans = [Span(page=1, label="text", box=None, id="p1-1", text="original text stays here")]
-    checked, stats = engine.check_spans(spans, None)
-    assert checked[0].text == "original text stays here"
-    assert checked[0].id == "p1-1"
-    assert stats.audit is not None and stats.audit.formatting_only
-
-
-def test_check_spans_rejects_duplicate_numbers(monkeypatch):
-    engine = _engine(monkeypatch)
-    _stub_generate(monkeypatch, "[1]\nfirst corrected\n[1]\nsecond corrected")
-    spans = [
-        Span(page=1, label="text", box=None, id="p1-1", text="first original"),
-        Span(page=1, label="text", box=None, id="p1-2", text="second original"),
-    ]
-    checked, _ = engine.check_spans(spans, None)
-    assert [s.text for s in checked] == ["first original", "second original"]
-
-
-def test_check_spans_empty_fragment_keeps_original(monkeypatch):
-    engine = _engine(monkeypatch)
-    _stub_generate(monkeypatch, "[1]\n[2]\nsecond corrected fragment text")
-    spans = [
-        Span(page=1, label="text", box=None, id="p1-1", text="first original text"),
-        Span(page=1, label="text", box=None, id="p1-2", text="second original text"),
-    ]
-    checked, _ = engine.check_spans(spans, None)
-    assert checked[0].text == "first original text"  # empty correction: original kept
-    assert checked[1].text == "second corrected fragment text"
-
-
-def test_check_spans_degenerate_falls_back(monkeypatch):
-    engine = _engine(monkeypatch)
-    _stub_generate(monkeypatch, "[1]\n.")
-    spans = [Span(page=1, label="text", box=None, id="p1-1", text="a reasonably long original fragment body")]
-    checked, _ = engine.check_spans(spans, None)
-    assert checked[0].text == "a reasonably long original fragment body"
-
-
-def test_format_and_parse_round_trip():
-    spans = [
-        Span(page=1, label="text", box=None, id="p1-1", text="line one\nline two"),
-        Span(page=1, label="text", box=None, id="p1-2", text="second fragment words"),
-    ]
-    block = format_fragments(spans)
-    assert block.startswith("[1]\nline one")
-    frags = parse_numbered_fragments(block, 2)
-    assert frags == {1: "line one\nline two", 2: "second fragment words"}
-
-
-def test_parse_numbered_fragments_keeps_final_fragment_extent():
-    # The last fragment extends to end-of-output; a later "fragment" with
-    # matching text would corrupt a wrong-end slice.
-    block = "[1]\nfirst\n[2]\nsecond\n[3]\nsecond"
-    frags = parse_numbered_fragments(block, 3)
-    assert frags == {1: "first", 2: "second", 3: "second"}
-
-
-def test_merge_audits_sums_counts_and_concatenates_samples():
-    from ocr_server.cleanup import CorrectionAudit, merge_audits
-
-    a = CorrectionAudit(n_words_in=10, n_words_out=11)
-    a.text_layer_backed.append("alpha")
-    a.format_added_words = 1
-    b = CorrectionAudit(n_words_in=5, n_words_out=5)
-    b.invented.append("zzz")
-    b.format_added_words = 2
-    merged = merge_audits([a, b])
-    assert merged.n_words_in == 15 and merged.n_words_out == 16
-    assert merged.text_layer_backed == ["alpha"]
-    assert merged.invented == ["zzz"]
-    assert merged.format_added_words == 3
-    assert not merged.formatting_only
-    assert merge_audits([]).formatting_only
-
-
-def test_parse_numbered_fragments_strictness():
-    assert parse_numbered_fragments("[1]\na\n[2]\nb", 2) == {1: "a", 2: "b"}
-    assert parse_numbered_fragments("[1] inline form", 1) == {1: "inline form"}
-    assert parse_numbered_fragments("[1]\na", 2) is None  # missing number
-    assert parse_numbered_fragments("[1]\na\n[2]\nb\n[3]\nc", 2) is None  # extra
-    assert parse_numbered_fragments("no markers at all", 1) is None
-    # Text is preserved verbatim between markers (whitespace-stripped).
-    assert parse_numbered_fragments("[1]\n  spaced  out  ", 1) == {1: "spaced  out"}
-
-
-def test_reflow_text_variants(monkeypatch):
-    engine = _engine(monkeypatch)
-    _stub_generate(monkeypatch, "canonical output")
-    text, stats = engine.reflow_text("some markdown body here", journal="pmc")
-    assert stats.method == "reflow+proofread"
-    assert text == "canonical output"
-    text, stats = engine.reflow_text(
-        "some markdown body here",
-        journal="pmc",
-        prompt_override="Fix {{journal}}:\n\n{{markdown}}",
-    )
-    assert stats.method == "reflow+journal-prompt"
-    assert text == "canonical output"
-    text, _ = engine.reflow_text("x" * 100, journal="nature", prompt_override="Q")
-    assert text == "x" * 100  # degenerate stub output falls back to input
-
-
-def test_audit_corrections_invented_and_format_only():
-    audit = audit_corrections("make this bold", "make this **bold**", None)
-    assert audit.formatting_only
-    audit.log_summary("format")  # exercises the formatting-only branch
-    audit = audit_corrections("alpha beta", "alpha zzz", None)
-    assert audit.invented == ["zzz"]
-    assert audit.n_words_in == 2 and audit.n_words_out == 2
-    audit.log_summary("test")  # must not raise
-
-
-# ---------- engine pure helpers ----------
-
-
-def test_dedupe_long_lines():
-    long = "x" * 50
-    assert _dedupe_long_lines(f"{long}\n{long}\nshort") == f"{long}\nshort"
-
-
-def test_loop_period():
-    assert _loop_period([1, 2] * 70) == 2
-    assert _loop_period(list(range(200))) is None
-    assert _loop_period([1]) is None
-
-
-class _StubTokenizer:
-    all_special_ids = [0]
-    pad_token_id = 1
-
-    def convert_ids_to_tokens(self, i):
-        return {2: "Ġ", 3: "a"}.get(i, "")
-
-
-def test_decode_byte_level_drops_specials():
-    assert decode_byte_level(_StubTokenizer(), [0, 1, 2, 3]) == " a"
-    assert decode_byte_level(_StubTokenizer(), [9]) == ""
-
-
-class _UnicodeTokenizer(_StubTokenizer):
-    def convert_ids_to_tokens(self, i):
-        return {2: "€"}.get(i, "")
+    monkeypatch.setattr(figures, "MAX_CROP_PX", 100)
+    uri = crop_data_uri(page_render, [0, 0, 1000, 1000])
+    assert uri is not None
+    import base64
+    import io
 
+    image = Image.open(io.BytesIO(base64.b64decode(uri.split(",", 1)[1])))
+    assert max(image.size) <= 100
 
-def test_decode_byte_level_falls_back_to_utf8():
-    assert decode_byte_level(_UnicodeTokenizer(), [2]) == "€"
-
-
-def test_ocr_engine_load_early_return():
-    eng = OcrEngine("some-ref")
-    assert eng.model_ref == "some-ref"
-    assert not eng.loaded
-    eng.model = object()  # pretend loaded: load() must not touch mlx
-    eng.load()
-    assert eng.loaded
-
-
-def test_get_ocr_engine_shortcuts():
-    from ocr_server.api import EngineHolder
-    from ocr_server.fake import FakeEngine
-
-    holder = EngineHolder()
-    holder.engine = FakeEngine()
-    holder.is_fake = False
-    holder.model_ref = "m"
-    assert holder.get_ocr_engine(None) is holder.engine
-    assert holder.get_ocr_engine("") is holder.engine
-    assert holder.get_ocr_engine("default") is holder.engine
-    assert holder.get_ocr_engine("m") is holder.engine
 
-
-def test_holder_load_fake_branch(monkeypatch):
-    from ocr_server import api as api_mod
-
-    monkeypatch.setenv("OCR_FAKE_ENGINE", "1")
-    monkeypatch.delenv("OCR_MODEL_REF", raising=False)
-    holder = api_mod.EngineHolder()
-    holder.load()
-    assert holder.is_fake and holder.engine.loaded
-    assert holder.model_ref == api_mod.DEFAULT_MODEL_REF
-
-
-def test_holder_load_real_branch_without_weights(monkeypatch):
-    from ocr_server import api as api_mod
-    from ocr_server.engine import OcrEngine as RealEngine
-
-    monkeypatch.delenv("OCR_FAKE_ENGINE", raising=False)
-    monkeypatch.setenv("OCR_MODEL_REF", "some-ref")
-    monkeypatch.setattr(RealEngine, "load", lambda self: None)
-    holder = api_mod.EngineHolder()
-    holder.load()
-    assert not holder.is_fake and holder.model_ref == "some-ref"
-
-
-def test_get_ocr_engine_lazy_alternate_without_weights(monkeypatch):
-    from ocr_server.api import DEFAULT_MODEL_BF16, EngineHolder
-    from ocr_server.engine import OcrEngine as RealEngine
-    from ocr_server.fake import FakeEngine
-
-    monkeypatch.setattr(RealEngine, "load", lambda self: None)
-    holder = EngineHolder()
-    holder.engine = FakeEngine()
-    holder.is_fake = False
-    holder.model_ref = "m"
-    alt = holder.get_ocr_engine("bf16")
-    assert isinstance(alt, RealEngine)
-    assert alt.model_ref == DEFAULT_MODEL_BF16
-    assert holder.get_ocr_engine("bf16") is alt  # resident afterwards
-
-
-# ---------- furniture generic pass ----------
-
-
-def _span(page: int, y1: int, text: str) -> Span:
-    return Span(page=page, label="text", box=[0, y1, 100, y1 + 10], text=text)
-
-
-def test_generic_fingerprinting_flags_repeats():
-    pages = [
-        [_span(1, 10, "Journal of Tests 2024"), _span(1, 500, "Body one")],
-        [_span(2, 10, "Journal of Tests 2025"), _span(2, 500, "Body two")],
-    ]
-    assert _apply_generic(pages) == 2
-    assert all(s.label == "furniture" for p in pages for s in p if s.text.startswith("Journal"))
-    assert pages[0][1].label == "text"  # body untouched
-
-
-def test_generic_needs_two_pages():
-    pages = [[_span(1, 10, "Repeated")]]
-    assert _apply_generic(pages) == 0
-    info = apply_furniture(pages, template="auto")
-    assert info["removed_total"] == 0 and info["template"] is None
-
-
-def test_band_edge_cases():
-    from ocr_server.furniture import _band
-
-    assert _band(Span(page=1, label="text", box=None, text="x")) is None
-    assert _band(_span(1, 500, "mid")) is None
-    assert _band(_span(1, 10, "top")) == "top"
-
-
-def test_generic_ignores_non_repeating_pages():
-    pages = [
-        [_span(1, 10, "Header one"), _span(1, 500, "Body one")],
-        [_span(2, 10, "Totally different"), _span(2, 500, "Body two")],
-    ]
-    assert _apply_generic(pages) == 0
-
-
-def test_generic_skips_bottom_band_and_relabeled():
-    bottom = _span(1, 960, "Footer")
-    bottom.box = [0, 900, 100, 960]
-    assert bottom.box is not None
-    pages = [
-        [bottom, _span(1, 500, "Body one")],
-        [_span(2, 960, "Footer"), _span(2, 500, "Body two")],
-    ]
-    pages[0][1].label = "furniture"  # already relabeled: skipped outright
-    assert _apply_generic(pages) >= 1
-
-
-# ---------- CLI entry point ----------
-
-
-def test_main_parses_flags_and_starts_uvicorn(monkeypatch):
-    import os
+def test_main_sets_layout_model_env(monkeypatch):
     import sys
 
     import uvicorn
 
-    import ocr_server.__main__ as main_mod
+    import ocr_server.__main__ as cli
 
-    calls: dict = {}
+    seen: dict = {}
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **k: seen.update(target=a, kwargs=k))
     monkeypatch.setattr(
-        uvicorn, "run", lambda *a, **k: calls.update(args=a, kwargs=k)
+        sys,
+        "argv",
+        ["ocr-server", "--port", "9999", "--layout-model", "/tmp/custom.onnx"],
     )
-    monkeypatch.setattr(
-        sys, "argv", ["ocr-server", "--fake-engine", "--port", "8311"]
-    )
-    monkeypatch.delenv("OCR_FAKE_ENGINE", raising=False)
-    main_mod.main()
-    assert os.environ["OCR_FAKE_ENGINE"] == "1"
-    assert calls["kwargs"]["port"] == 8311
-    assert calls["kwargs"]["host"] == "127.0.0.1"
-    assert calls["args"] == ("ocr_server.api:app",)
+    monkeypatch.delenv("OCR_LAYOUT_MODEL", raising=False)
+    cli.main()
+    assert seen["target"][0] == "ocr_server.api:app"
+    assert seen["kwargs"]["port"] == 9999
+    assert os.environ["OCR_LAYOUT_MODEL"] == "/tmp/custom.onnx"
+
+
+def test_main_without_layout_model_keeps_env(monkeypatch):
+    import sys
+
+    import uvicorn
+
+    import ocr_server.__main__ as cli
+
+    seen: dict = {}
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **k: seen.update(kwargs=k))
+    monkeypatch.setattr(sys, "argv", ["ocr-server"])
+    monkeypatch.delenv("OCR_LAYOUT_MODEL", raising=False)
+    cli.main()
+    assert "OCR_LAYOUT_MODEL" not in os.environ
+    assert seen["kwargs"]["port"] == 8300
+
+
+# ---------- PP-DocLayout post-processing ----------
+
+
+def _row(class_id: int, score: float, box: list[float]) -> list[float]:
+    return [class_id, score, *box]
+
+
+def test_clean_regions_keeps_only_capture_classes_and_score():
+    rows = [
+        _row(1, 0.9, [0, 0, 400, 400]),  # image -> kept
+        _row(18, 0.9, [500, 0, 900, 400]),  # chart -> kept
+        _row(2, 0.9, [0, 500, 400, 900]),  # text -> dropped
+        _row(1, SCORE_MIN - 0.01, [500, 500, 900, 900]),  # low score -> dropped
+        _row(99, 0.9, [0, 0, 10, 10]),  # unknown class id -> dropped
+    ]
+    kept = clean_regions(rows, page=1, width=1000, height=1000)
+    assert [(r.kind, r.box) for r in kept] == [
+        ("image", [0, 0, 400, 400]),
+        ("chart", [500, 0, 900, 400]),
+    ]
+
+
+def test_clean_regions_drops_small_and_oversized_regions():
+    rows = [
+        _row(1, 0.9, [0, 0, MIN_DIM - 1, 500]),  # thin -> dropped
+        _row(1, 0.9, [0, 0, 500, MIN_DIM - 1]),  # short -> dropped
+        _row(1, 0.9, [0, 0, 1000, 1000]),  # whole page -> dropped
+    ]
+    assert clean_regions(rows, 1, 1000, 1000) == []
+
+
+def test_clean_regions_dedupes_contained_and_overlapping():
+    rows = [
+        _row(1, 0.9, [100, 100, 500, 500]),  # small sub-panel
+        _row(18, 0.8, [0, 0, 1000, 600]),  # bigger surrounding region
+        _row(1, 0.7, [0, 0, 100, 100]),  # tiny, below min dim
+    ]
+    kept = clean_regions(rows, 1, 1000, 1000)
+    assert len(kept) == 1
+    assert kept[0].box == [0, 0, 1000, 600]
+    assert kept[0].kind == "chart"
+
+
+def test_clean_regions_area_share_boundary():
+    rows = [_row(1, 0.9, [0, 0, 1000, int(1000 * (MAX_AREA_SHARE + 0.01))])]
+    assert clean_regions(rows, 1, 1000, 1000) == []
+    rows = [_row(1, 0.9, [0, 0, 1000, int(1000 * (MAX_AREA_SHARE - 0.01))])]
+    assert len(clean_regions(rows, 1, 1000, 1000)) == 1
+
+
+def test_clamp_box_scales_and_sorts():
+    assert _clamp_box([0, 0, 500, 1000], 1000, 1000) == [0, 0, 500, 1000]
+    assert _clamp_box([500, 1000, 0, 0], 1000, 1000) == [0, 0, 500, 1000]
+    assert _clamp_box([-50, -50, 1200, 1200], 1000, 1000) == [0, 0, 1000, 1000]
+    assert _clamp_box([1, 2, 3, 4], 0, 10) == [0, 0, 0, 0]
+
+
+def test_iou_and_center_inside_helpers():
+    assert _iou([0, 0, 10, 10], [0, 0, 10, 10]) == 1.0
+    assert _iou([0, 0, 10, 10], [20, 20, 30, 30]) == 0.0
+    assert _center_inside([0, 0, 10, 10], [-5, -5, 20, 20])
+    assert not _center_inside([0, 0, 10, 10], [20, 20, 30, 30])
+
+
+# ---------- merge ----------
+
+
+def _native(label: str, box: list[int], text: str = "body", order: int = 0) -> NativeBox:
+    return NativeBox(page=1, label=label, box=box, text=text, order=order)
+
+
+def _region(box: list[int]) -> FigureRegion:
+    return FigureRegion(page=1, box=box, kind="image", score=0.9)
+
+
+def test_merge_replaces_matching_picture_with_figure():
+    native = [
+        _native("header", [0, 0, 1000, 40], "running head"),
+        _native("picture", [100, 100, 500, 500], ""),
+        _native("text", [100, 600, 900, 700], "body"),
+    ]
+    spans, warnings = merge_page(native, [(_region([100, 100, 500, 500]), "data:x")], 1)
+    assert warnings == []
+    assert [s.label for s in spans] == ["header", "image", "text"]
+    assert spans[1].image == "data:x"
+    assert spans[1].box == [100, 100, 500, 500]
+    assert spans[1].text == ""
+
+
+def test_merge_emits_multi_matched_region_once():
+    native = [
+        _native("picture", [0, 0, 1000, 60], ""),
+        _native("picture", [0, 100, 1000, 900], ""),
+    ]
+    spans, _ = merge_page(native, [(_region([0, 50, 1000, 950]), "data:x")], 1)
+    assert [s.label for s in spans] == ["image"]
+
+
+def test_merge_appends_unmatched_figures_in_reading_order():
+    native = [_native("text", [100, 700, 900, 800], "body")]
+    figures = [
+        (_region([100, 400, 900, 600]), "data:b"),
+        (_region([100, 100, 900, 300]), "data:a"),
+    ]
+    spans, _ = merge_page(native, figures, 1)
+    assert [s.image for s in spans if s.label == "image"] == ["data:a", "data:b"]
+    assert [s.label for s in spans] == ["text", "image", "image"]
+
+
+def test_merge_relabels_content_inside_figures():
+    native = [
+        _native("text", [200, 200, 400, 300], "axis label"),
+        _native("caption", [200, 250, 400, 280], "fig 1"),
+        _native("text", [50, 50, 100, 60], "outside"),
+    ]
+    figures = [(_region([100, 100, 500, 500]), None)]
+    spans, warnings = merge_page(native, figures, 1)
+    labels = {s.text: s.label for s in spans}
+    assert labels["axis label"] == "figure_text"
+    assert labels["fig 1"] == "caption"  # captions are never relabeled
+    assert labels["outside"] == "text"
+    # Unmatched region appended with a warning (crop failed -> still a span).
+    assert warnings == ["figure crop failed on page 1"]
+    figure_spans = [s for s in spans if s.label == "image"]
+    assert len(figure_spans) == 1 and figure_spans[0].image is None
+
+
+def test_select_figures_requires_native_corroboration():
+    native = [_native("picture", [100, 100, 500, 500])]
+    aligned = _region([110, 110, 490, 490])
+    text_region = _region([0, 600, 1000, 1000])
+    assert select_figures([aligned, text_region], native) == [aligned]
+    assert select_figures([text_region], []) == []
+
+
+def test_figure_span_shape():
+    span = _figure_span(3, _region([1, 2, 3, 4]), "data:x")
+    assert (span.page, span.label, span.text, span.image) == (3, "image", "", "data:x")
+    # Box is copied, not aliased.
+    assert span.box == [1, 2, 3, 4]
+
+
+def test_picture_matches_by_iou_or_containment():
+    assert _picture_matches([100, 100, 500, 500], [110, 110, 490, 490])
+    assert _picture_matches([0, 0, 100, 100], [50, 50, 900, 900])
+    assert _picture_matches([800, 800, 900, 900], [0, 0, 1000, 1000])
+    assert not _picture_matches([0, 0, 10, 10], [500, 500, 600, 600])
+
+
+def test_capture_classes_are_figures_only():
+    assert CAPTURE_CLASSES == {"image", "chart"}
+    assert DEDUPE_IOU > 0.5

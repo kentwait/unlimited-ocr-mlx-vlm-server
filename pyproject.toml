@@ -1,7 +1,7 @@
 [project]
 name = "unlimited-ocr-server"
-version = "0.3.0"
-description = "LAN FastAPI server wrapping LoJexLLM/Unlimited-OCR-MLX: PDF & image -> markdown via MLX on Apple Silicon"
+version = "0.4.0"
+description = "FastAPI sidecar: digital-born PDF -> structured spans (pymupdf4llm text/structure + PP-DocLayout-S figures)"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -13,19 +13,15 @@ dependencies = [
     "anyio>=4.4.0",
     "pillow>=10.0.0",
     "numpy>=1.24.0",
-    "pymupdf>=1.24.0",
-    "mlx>=0.20.0",
-    "safetensors>=0.4.0",
-    "transformers>=4.45.0",
-    "mlx-vlm>=0.7.0",
-    "jinja2>=3.1.6",
+    "pymupdf>=1.28.0",
+    "pymupdf4llm>=1.28.0",
+    "onnxruntime>=1.18.0",
 ]
 
 [dependency-groups]
 dev = [
     "pytest>=8.0.0",
     "httpx>=0.27.0",
-    "huggingface-hub[hf_xet]>=0.30.0",
     "pytest-cov>=7.1.0",
     "hypothesis>=6.168.0",
     "mutmut>=3.7.0",
@@ -57,13 +53,6 @@ skip_covered = false
 [tool.mutmut]
 # Manual mutation runs only (`make mutate`), never CI.
 source_paths = ["src/ocr_server"]
-# The mutant sandbox copies source+tests only; prompts/ must ride along
-# (PromptRegistry resolves it relative to the package files).
-also_copy = ["prompts/"]
-# fake.py is a dev-only test double: mutating the stub is noise, and its
-# observable behavior is pinned by the API contract tests instead.
-do_not_mutate = ["src/ocr_server/fake.py"]
 # Log-call lines are not behavior: no test asserts log text, and message
 # mutants only add noise to triage.
 do_not_mutate_patterns = ["^\\s*log\\.(debug|info|warning|error|exception)\\("]
-# Weight-only functions carry `# pragma: no mutate block` at the definition.

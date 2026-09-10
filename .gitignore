@@ -9,8 +9,9 @@ htmlcov/
 .mutmut-cache/
 mutants/
 
-# Model weights (6.7 GB — fetched via scripts/download_model.py)
-models/
+# Local scratch model downloads (the vendored PP-DocLayout-S asset lives
+# under src/ocr_server/models/ and is tracked)
+/models/
 
 # Local scratch
 output/

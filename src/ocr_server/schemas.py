@@ -47,12 +47,41 @@ class JobStatus(BaseModel):
     pages_total: int | None = None
 
 
+class AssistantModel(BaseModel):
+    """One pinned model catalog entry and its per-entry state."""
+
+    id: str  # Hugging Face reference
+    label: str  # short quantization label, e.g. "int8"
+    bits: int  # quantization width (0 when unknown)
+    size_bytes: int | None = None  # aggregate Hub size, null while unknown
+    downloaded: bool = False  # complete snapshot present in the local HF cache
+    partial: bool = False  # a cancelled/in-progress cache (resumable)
+    active: bool = False  # the model currently selected/loaded
+
+
+class AssistantModelsResponse(BaseModel):
+    """The model catalog, independent of lifecycle state."""
+
+    available: bool
+    models: list[AssistantModel] = []
+
+
+class AssistantModelRequest(BaseModel):
+    """Body for download/use: a catalog entry id (defaults to active)."""
+
+    model: str | None = None
+
+
 class AssistantStatus(BaseModel):
     """Local assistant model lifecycle, polled by the chat panel."""
 
     available: bool  # the optional model runtime is installed in this build
-    state: str  # not_downloaded | downloading | loading | ready | failed
-    model: str  # pinned model reference
+    # not_downloaded | downloading | paused | loading | ready | failed
+    state: str
+    model: str  # selected model reference
     loaded: bool = False  # weights resident in memory
     progress: float | None = None  # 0..1 while downloading
     detail: str | None = None  # failure explanation
+    #: model id being downloaded, while downloading or paused
+    download_target: str | None = None
+    models: list[AssistantModel] = []  # catalog with per-entry state

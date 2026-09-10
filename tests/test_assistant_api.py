@@ -17,13 +17,16 @@ import pytest
 
 from ocr_server import assistant as assistant_mod
 from ocr_server.assistant import (
+    AssistantBusy,
     AssistantRuntime,
     AssistantUnavailable,
+    DownloadCancelled,
     FakeAssistantRuntime,
     ModelNotReady,
     _coerce_float,
     _coerce_int,
     _dir_size,
+    cancellable_tqdm,
     sampling_kwargs,
 )
 
@@ -127,7 +130,7 @@ def test_not_downloaded_model_raises(monkeypatch):
     runtime = AssistantRuntime()
     runtime.available = True
     runtime.state = "not_downloaded"
-    monkeypatch.setattr(runtime, "_is_downloaded", lambda: False)
+    monkeypatch.setattr(runtime, "_is_downloaded", lambda ref: False)
     with pytest.raises(ModelNotReady):
         runtime.ensure_loaded()
 
@@ -347,8 +350,11 @@ def test_start_download_returns_when_busy(monkeypatch):
     runtime = AssistantRuntime()
     runtime.available = True
     runtime.state = "downloading"
-    runtime.start_download()  # no thread started
+    runtime._download_target = runtime.model_ref
+    runtime.start_download()  # same target: idempotent, no thread started
     assert runtime.state == "downloading"
+    with pytest.raises(AssistantBusy):
+        runtime.start_download("mlx-community/Qwen3.5-9B-MLX-4bit")
     runtime.state = "ready"
     runtime.loaded = True
     runtime.start_download()
@@ -360,7 +366,7 @@ def test_start_download_starts_worker(monkeypatch):
     runtime.available = True
     runtime.state = "not_downloaded"
     done = threading.Event()
-    monkeypatch.setattr(runtime, "_download_and_load", done.set)
+    monkeypatch.setattr(runtime, "_download_and_load", lambda target: done.set())
     runtime.start_download()
     assert runtime.state == "downloading"
     assert done.wait(2)
@@ -396,7 +402,7 @@ def test_ensure_loaded_with_stub_mlx(monkeypatch):
     runtime = AssistantRuntime()
     runtime.available = True
     runtime.state = "ready"
-    monkeypatch.setattr(runtime, "_is_downloaded", lambda: True)
+    monkeypatch.setattr(runtime, "_is_downloaded", lambda ref: True)
     runtime.ensure_loaded()
     assert runtime.loaded is True
     assert runtime.state == "ready"
@@ -420,7 +426,7 @@ def test_ensure_loaded_failure_marks_failed(monkeypatch):
     runtime = AssistantRuntime()
     runtime.available = True
     runtime.state = "ready"
-    monkeypatch.setattr(runtime, "_is_downloaded", lambda: True)
+    monkeypatch.setattr(runtime, "_is_downloaded", lambda ref: True)
     with pytest.raises(ModelNotReady, match="weights corrupt"):
         runtime.ensure_loaded()
     assert runtime.state == "failed"
@@ -680,7 +686,8 @@ def test_preflight_not_ready_exact_states_and_detail():
     runtime = AssistantRuntime()
     runtime.available = True
     runtime.loaded = False
-    for state in ("not_downloaded", "failed"):
+    runtime.detail = None
+    for state in ("not_downloaded", "paused", "failed"):
         runtime.state = state
         with pytest.raises(Exception) as excinfo:
             _preflight(runtime)
@@ -688,7 +695,7 @@ def test_preflight_not_ready_exact_states_and_detail():
         assert excinfo.value.detail == (  # type: ignore[attr-defined]
             "assistant model is not ready; download it first"
         )
-    for state in ("NOT_DOWNLOADED", "FAILED", "ready"):
+    for state in ("NOT_DOWNLOADED", "ready", "loading", "downloading"):
         runtime.state = state
         _preflight(runtime)  # state matching is exact and case-sensitive
 
@@ -746,8 +753,14 @@ def test_sampling_kwargs_full_shape():
     }
 
 
-def test_status_shape_exact():
+def test_status_shape_exact(monkeypatch):
     runtime = AssistantRuntime("test/model")
+    monkeypatch.setattr(
+        runtime,
+        "_cache_state",
+        lambda ref: "complete" if ref == "test/model" else "absent",
+    )
+    monkeypatch.setattr(runtime, "_size_bytes", lambda ref: 123)
     status = runtime.status()
     assert status == {
         "available": runtime.available,
@@ -756,6 +769,36 @@ def test_status_shape_exact():
         "loaded": False,
         "progress": None,
         "detail": runtime.detail,
+        "download_target": None,
+        "models": [
+            {
+                "id": "test/model",
+                "label": "model",
+                "bits": 0,
+                "size_bytes": 123,
+                "downloaded": True,
+                "partial": False,
+                "active": False,
+            },
+            {
+                "id": "mlx-community/Qwen3.5-9B-MLX-8bit",
+                "label": "int8",
+                "bits": 8,
+                "size_bytes": 123,
+                "downloaded": False,
+                "partial": False,
+                "active": False,
+            },
+            {
+                "id": "mlx-community/Qwen3.5-9B-MLX-4bit",
+                "label": "int4",
+                "bits": 4,
+                "size_bytes": 123,
+                "downloaded": False,
+                "partial": False,
+                "active": False,
+            },
+        ],
     }
 
 
@@ -790,16 +833,18 @@ def _stub_hub(monkeypatch, snapshot, cache=None):
 def test_is_downloaded_snapshot_success(monkeypatch):
     _stub_hub(monkeypatch, lambda *a, **k: "/cache", None)
     runtime = AssistantRuntime()
-    assert runtime._is_downloaded() is True
+    assert runtime._is_downloaded(runtime.model_ref) is True
 
 
-def test_is_downloaded_falls_back_to_cached_config(monkeypatch):
+def test_is_downloaded_rejects_incomplete_snapshot(monkeypatch):
     def boom(*args, **kwargs):
         raise RuntimeError("incomplete snapshot")
 
+    # A cached config alone must not read as downloaded; the snapshot is
+    # incomplete (or absent), so Use/chat must not treat it as ready.
     _stub_hub(monkeypatch, boom, "/cache/config.json")
     runtime = AssistantRuntime()
-    assert runtime._is_downloaded() is True
+    assert runtime._is_downloaded(runtime.model_ref) is False
 
 
 def test_is_downloaded_false_without_cache(monkeypatch):
@@ -808,7 +853,7 @@ def test_is_downloaded_false_without_cache(monkeypatch):
 
     _stub_hub(monkeypatch, boom, None)
     runtime = AssistantRuntime()
-    assert runtime._is_downloaded() is False
+    assert runtime._is_downloaded(runtime.model_ref) is False
 
 
 def test_is_downloaded_false_without_hub(monkeypatch):
@@ -816,7 +861,7 @@ def test_is_downloaded_false_without_hub(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "huggingface_hub", None)
     runtime = AssistantRuntime()
-    assert runtime._is_downloaded() is False
+    assert runtime._is_downloaded(runtime.model_ref) is False
 
 
 def test_dir_size_continues_after_oserror(monkeypatch, tmp_path):
@@ -844,7 +889,7 @@ def test_start_download_resets_detail_and_progress(monkeypatch):
     runtime.detail = "old failure"
     runtime.progress = 0.5
     done = threading.Event()
-    monkeypatch.setattr(runtime, "_download_and_load", done.set)
+    monkeypatch.setattr(runtime, "_download_and_load", lambda target: done.set())
     runtime.start_download()
     assert runtime.state == "downloading"
     assert runtime.progress == 0.0
@@ -994,9 +1039,9 @@ def test_ensure_loaded_transitions_loading_then_ready(monkeypatch):
     runtime = AssistantRuntime()
     runtime.available = True
     runtime.state = "not_downloaded"
-    monkeypatch.setattr(runtime, "_is_downloaded", lambda: True)
+    monkeypatch.setattr(runtime, "_is_downloaded", lambda ref: True)
 
-    def fake_load() -> None:
+    def fake_load(ref: str) -> None:
         seen["state_during_load"] = runtime.state
         runtime.loaded = True
 
@@ -1011,6 +1056,7 @@ def test_start_download_is_idempotent_while_running():
     runtime = AssistantRuntime()
     runtime.available = True
     runtime.state = "downloading"
+    runtime._download_target = runtime.model_ref
     runtime.start_download()
     assert runtime._thread is None  # never started for an in-flight download
 
@@ -1038,11 +1084,11 @@ def test_is_downloaded_non_string_cache_value(monkeypatch):
 
     _stub_hub(monkeypatch, boom, object())
     runtime = AssistantRuntime()
-    assert runtime._is_downloaded() is False
+    assert runtime._is_downloaded(runtime.model_ref) is False
 
 
 def test_init_marks_ready_when_cached(monkeypatch):
-    monkeypatch.setattr(AssistantRuntime, "_is_downloaded", lambda self: True)
+    monkeypatch.setattr(AssistantRuntime, "_is_downloaded", lambda self, ref: True)
     monkeypatch.setattr(
         assistant_mod.importlib.util, "find_spec", lambda name: object()
     )
@@ -1066,3 +1112,314 @@ def test_start_download_unavailable_message_uses_detail():
 def test_sampling_kwargs_invalid_repetition_falls_back_to_one():
     kwargs = sampling_kwargs({"repetition_penalty": "junk"})
     assert kwargs["repetition_penalty"] == 1.0
+
+
+# ---------- model catalog and management ----------
+
+INT8 = assistant_mod.DEFAULT_MODEL
+INT4 = "mlx-community/Qwen3.5-9B-MLX-4bit"
+
+
+def test_models_endpoint_lists_catalog(client, fake_runtime):
+    body = client.get("/assistant/models").json()
+    assert body["available"] is True
+    by_id = {model["id"]: model for model in body["models"]}
+    assert by_id[INT8]["downloaded"] is True
+    assert by_id[INT8]["active"] is True
+    assert by_id[INT8]["label"] == "int8"
+    assert by_id[INT8]["bits"] == 8
+    assert by_id[INT8]["size_bytes"] == 10_400_000_000
+    assert by_id[INT4]["downloaded"] is False
+    assert by_id[INT4]["active"] is False
+    assert by_id[INT4]["label"] == "int4"
+
+
+def test_models_endpoint_unavailable(client, unavailable_runtime, monkeypatch):
+    monkeypatch.setattr(
+        unavailable_runtime, "_cache_state", lambda ref: "absent"
+    )
+    body = client.get("/assistant/models").json()
+    assert body["available"] is False
+    assert len(body["models"]) == len(assistant_mod.MODEL_CATALOG)
+    assert all(model["downloaded"] is False for model in body["models"])
+
+
+def test_download_does_not_hijack_active_model(client, fake_runtime):
+    body = client.post(
+        "/assistant/model/download", json={"model": INT4}
+    ).json()
+    assert body["state"] == "ready"
+    assert body["model"] == INT8  # the active model is unchanged
+    by_id = {model["id"]: model for model in body["models"]}
+    assert by_id[INT4]["downloaded"] is True
+    assert by_id[INT4]["active"] is False
+    assert by_id[INT8]["active"] is True
+
+
+def test_use_switches_to_downloaded_model(client, fake_runtime):
+    client.post("/assistant/model/download", json={"model": INT4})
+    body = client.post("/assistant/model/use", json={"model": INT4}).json()
+    assert body["model"] == INT4
+    by_id = {model["id"]: model for model in body["models"]}
+    assert by_id[INT4]["active"] is True
+    assert by_id[INT8]["active"] is False
+
+
+def test_use_not_downloaded_is_409(client, fake_runtime):
+    response = client.post("/assistant/model/use", json={"model": INT4})
+    assert response.status_code == 409
+    assert "not downloaded" in response.json()["detail"]
+
+
+def test_use_requires_model_is_400(client, fake_runtime):
+    response = client.post("/assistant/model/use", json={})
+    assert response.status_code == 400
+
+
+def test_use_unavailable_is_501(client, unavailable_runtime):
+    response = client.post("/assistant/model/use", json={"model": INT8})
+    assert response.status_code == 501
+
+
+def test_cancel_download_sets_paused(client, fake_runtime):
+    body = client.post("/assistant/model/cancel").json()
+    assert body["state"] == "paused"
+    assert body["detail"] == "download cancelled"
+
+
+def test_download_busy_other_target_is_409(monkeypatch, client):
+    runtime = AssistantRuntime()
+    runtime.available = True
+    runtime.state = "downloading"
+    runtime._download_target = INT8
+    monkeypatch.setattr(assistant_mod, "get_runtime", lambda: runtime)
+    response = client.post(
+        "/assistant/model/download", json={"model": INT4}
+    )
+    assert response.status_code == 409
+
+
+def test_cancellable_tqdm_raises_when_set():
+    event = threading.Event()
+    event.set()
+    cls = cancellable_tqdm(event)
+    bar = cls(total=1, disable=True)
+    with pytest.raises(DownloadCancelled):
+        bar.update(1)
+
+
+def test_cancellable_tqdm_passes_through_when_clear():
+    cls = cancellable_tqdm(threading.Event())
+    bar = cls(total=1, disable=True)
+    bar.update(1)  # no raise
+
+
+def test_use_switches_and_unloads(monkeypatch):
+    runtime = AssistantRuntime()
+    runtime.available = True
+    runtime.model_ref = INT8
+    runtime.loaded = True
+    calls: list[str] = []
+    monkeypatch.setattr(runtime, "_is_downloaded", lambda ref: True)
+    monkeypatch.setattr(runtime, "_unload", lambda: calls.append("unload"))
+    monkeypatch.setattr(
+        runtime, "_load_sync", lambda ref: calls.append(f"load:{ref}")
+    )
+    runtime.use(INT4)
+    assert calls == ["unload", f"load:{INT4}"]
+    assert runtime.model_ref == INT4
+    assert runtime.loaded is True
+    assert runtime.state == "ready"
+
+
+def test_use_same_loaded_model_is_noop(monkeypatch):
+    runtime = AssistantRuntime()
+    runtime.available = True
+    runtime.model_ref = INT8
+    runtime.loaded = True
+    calls: list[str] = []
+    monkeypatch.setattr(runtime, "_unload", lambda: calls.append("unload"))
+    runtime.use(INT8)
+    assert calls == []
+
+
+def test_use_load_failure_marks_failed(monkeypatch):
+    runtime = AssistantRuntime()
+    runtime.available = True
+    runtime.model_ref = INT8
+    runtime.loaded = False
+    monkeypatch.setattr(runtime, "_is_downloaded", lambda ref: True)
+    monkeypatch.setattr(runtime, "_unload", lambda: None)
+
+    def boom(ref: str) -> None:
+        raise RuntimeError("weights corrupt")
+
+    monkeypatch.setattr(runtime, "_load_sync", boom)
+    with pytest.raises(ModelNotReady, match="weights corrupt"):
+        runtime.use(INT4)
+    assert runtime.state == "failed"
+    assert runtime.detail == "weights corrupt"
+
+
+def test_cancel_download_noop_when_not_downloading():
+    runtime = AssistantRuntime()
+    runtime.state = "ready"
+    runtime.cancel_download()
+    assert runtime.state == "ready"
+
+
+def test_download_and_load_handles_cancelled_download(monkeypatch):
+    runtime = AssistantRuntime()
+    runtime.available = True
+
+    def cancel(ref: str) -> None:
+        raise DownloadCancelled()
+
+    monkeypatch.setattr(runtime, "_download_sync", cancel)
+    runtime._download_and_load(INT8)
+    assert runtime.state == "paused"
+    assert runtime.detail == "download cancelled"
+
+
+def test_download_and_load_marks_paused_when_cancelled_after_sync(monkeypatch):
+    runtime = AssistantRuntime()
+    runtime.available = True
+    monkeypatch.setattr(runtime, "_download_sync", lambda ref: None)
+    runtime._cancel.set()
+    runtime._download_and_load(INT8)
+    assert runtime.state == "paused"
+
+
+def test_download_and_load_marks_failed_on_error(monkeypatch):
+    runtime = AssistantRuntime()
+    runtime.available = True
+
+    def boom(ref: str) -> None:
+        raise RuntimeError("no disk")
+
+    monkeypatch.setattr(runtime, "_download_sync", boom)
+    runtime._download_and_load(INT8)
+    assert runtime.state == "failed"
+    assert runtime.detail == "no disk"
+
+
+def test_real_models_status_active_only_when_ready(monkeypatch):
+    runtime = AssistantRuntime()
+    runtime.available = True
+    runtime.state = "not_downloaded"
+    runtime.loaded = False
+    monkeypatch.setattr(runtime, "_is_downloaded", lambda ref: True)
+    monkeypatch.setattr(runtime, "_size_bytes", lambda ref: None)
+    assert all(not model["active"] for model in runtime.models())
+    runtime.state = "ready"
+    active = [model["id"] for model in runtime.models() if model["active"]]
+    assert active == [runtime.model_ref]
+
+
+def test_status_reports_download_target_scope():
+    runtime = AssistantRuntime("m")
+    runtime.available = True
+    runtime._download_target = "target/model"
+    runtime.state = "downloading"
+    assert runtime.status()["download_target"] == "target/model"
+    runtime.state = "paused"
+    assert runtime.status()["download_target"] == "target/model"
+    runtime.state = "ready"
+    assert runtime.status()["download_target"] is None
+
+
+def test_fake_cancel_keeps_download_target(client, fake_runtime):
+    client.post("/assistant/model/download", json={"model": INT4})
+    body = client.post("/assistant/model/cancel").json()
+    assert body["state"] == "paused"
+    assert body["download_target"] == INT4
+
+
+# ---------- download never hijacks an existing model ----------
+
+
+def test_download_auto_loads_when_no_model_present(monkeypatch):
+    runtime = AssistantRuntime()
+    runtime.available = True
+    runtime.loaded = False
+    loaded: list[str] = []
+    monkeypatch.setattr(runtime, "_download_sync", lambda ref: None)
+    monkeypatch.setattr(runtime, "_load_sync", lambda ref: loaded.append(ref))
+    monkeypatch.setattr(runtime, "_is_downloaded", lambda ref: ref == INT4)
+    runtime._download_and_load(INT4)
+    assert loaded == [INT4]
+    assert runtime.model_ref == INT4
+    assert runtime.loaded is True
+    assert runtime.state == "ready"
+
+
+def test_download_does_not_hijack_when_another_is_downloaded(monkeypatch):
+    runtime = AssistantRuntime()
+    runtime.available = True
+    runtime.loaded = False
+    runtime.model_ref = INT8
+    loaded: list[str] = []
+    monkeypatch.setattr(runtime, "_download_sync", lambda ref: None)
+    monkeypatch.setattr(runtime, "_load_sync", lambda ref: loaded.append(ref))
+    # The selected model is downloaded but not resident: no auto-load.
+    monkeypatch.setattr(runtime, "_is_downloaded", lambda ref: ref == INT8)
+    runtime._download_and_load(INT4)
+    assert loaded == []
+    assert runtime.model_ref == INT8
+    assert runtime.loaded is False
+    assert runtime.state == "ready"
+
+
+def test_download_does_not_hijack_a_loaded_model(monkeypatch):
+    runtime = AssistantRuntime()
+    runtime.available = True
+    runtime.loaded = True
+    runtime.model_ref = INT8
+    loaded: list[str] = []
+    monkeypatch.setattr(runtime, "_download_sync", lambda ref: None)
+    monkeypatch.setattr(runtime, "_load_sync", lambda ref: loaded.append(ref))
+    monkeypatch.setattr(runtime, "_is_downloaded", lambda ref: ref == INT8)
+    runtime._download_and_load(INT4)
+    assert loaded == []
+    assert runtime.model_ref == INT8
+    assert runtime.loaded is True
+    assert runtime.state == "ready"
+
+
+# ---------- cache completion is strict (partial is not downloaded) ----------
+
+
+def test_cache_state_complete_when_snapshot_ok(monkeypatch):
+    runtime = AssistantRuntime()
+    _stub_hub(monkeypatch, lambda *a, **k: "/cache", None)
+    assert runtime._cache_state("org/model") == "complete"
+
+
+def test_cache_state_partial_when_incomplete_and_dir_exists(
+    monkeypatch, tmp_path
+):
+    runtime = AssistantRuntime()
+    monkeypatch.setattr(runtime, "_cache_dir", lambda ref: tmp_path)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("incomplete snapshot")
+
+    _stub_hub(monkeypatch, boom, None)
+    assert runtime._cache_state("org/model") == "partial"
+    monkeypatch.setattr(runtime, "_cache_dir", lambda ref: tmp_path / "missing")
+    assert runtime._cache_state("org/model") == "absent"
+
+
+def test_models_status_reports_partial(monkeypatch):
+    runtime = AssistantRuntime()
+    runtime.available = True
+    monkeypatch.setattr(runtime, "_size_bytes", lambda ref: None)
+    monkeypatch.setattr(
+        runtime,
+        "_cache_state",
+        lambda ref: "partial" if ref == assistant_mod.DEFAULT_MODEL else "absent",
+    )
+    entries = {model["id"]: model for model in runtime.models()}
+    default = entries[assistant_mod.DEFAULT_MODEL]
+    assert default["downloaded"] is False
+    assert default["partial"] is True

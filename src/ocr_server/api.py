@@ -59,7 +59,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Paperhub PDF Parser",
     description="Digital-born PDF -> structured spans (pymupdf4llm + PP-DocLayout-S)",
-    version="0.4.0",
+    version="0.5.0",
     lifespan=lifespan,
 )
 
@@ -218,7 +218,10 @@ async def root() -> dict:
             "/parse/pdf",
             "/parse/jobs",
             "/assistant/status",
+            "/assistant/models",
             "/assistant/model/download",
+            "/assistant/model/use",
+            "/assistant/model/cancel",
             "/v1/chat/completions",
         ],
     }

@@ -31,6 +31,10 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
     temperature: float | None = None
     max_tokens: int | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    presence_penalty: float | None = None
+    repetition_penalty: float | None = None
 
 
 def _payload(request: ChatCompletionRequest) -> dict[str, Any]:
@@ -40,6 +44,10 @@ def _payload(request: ChatCompletionRequest) -> dict[str, Any]:
         "tools": request.tools,
         "temperature": request.temperature,
         "max_tokens": request.max_tokens,
+        "top_p": request.top_p,
+        "top_k": request.top_k,
+        "presence_penalty": request.presence_penalty,
+        "repetition_penalty": request.repetition_penalty,
     }
 
 

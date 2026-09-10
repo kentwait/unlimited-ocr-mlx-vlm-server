@@ -52,6 +52,64 @@ def test_parse_tool_calls_keeps_inner_newlines():
     assert args["queries"] == "line one\nline two"
 
 
+def test_filter_drops_stray_closers_and_whitespace():
+    flt = QwenStreamFilter()
+    emitted = flt.feed("answer arrays")
+    emitted += flt.feed("</parameter>\n</function>\n")
+    emitted += flt.feed("</tool_call> tail")
+    tail, blocks = flt.finish()
+    assert emitted + tail == "answer arrays tail"
+    assert blocks == []
+
+
+def test_filter_captures_orphan_function_block():
+    flt = QwenStreamFilter()
+    emitted = flt.feed(
+        "before <function=search><parameter=query>satellite"
+        "</parameter></function> after"
+    )
+    tail, blocks = flt.finish()
+    assert emitted + tail == "before  after"
+    calls = parse_tool_calls(blocks)
+    assert calls[0]["function"]["name"] == "search"
+    assert json.loads(calls[0]["function"]["arguments"]) == {
+        "query": "satellite"
+    }
+
+
+def test_filter_absorbs_tool_call_close_and_newline():
+    flt = QwenStreamFilter()
+    emitted = flt.feed(
+        "<tool_call>\n<function=search>\n<parameter=query>x\n</parameter>\n"
+        "</function>\n</tool_call>\nanswer"
+    )
+    tail, blocks = flt.finish()
+    assert emitted + tail == "answer"
+    assert len(blocks) == 1
+
+
+def test_parse_tool_calls_cleans_nested_fragments():
+    block = (
+        "<function=search><parameter=query>satellite<tool_call><function=search>"
+        "<parameter=query>satellite</parameter></function>"
+    )
+    calls = parse_tool_calls([block])
+    arguments = json.loads(calls[0]["function"]["arguments"])
+    assert "<" not in arguments["query"]
+    assert "satellite" in arguments["query"]
+
+
+def test_parse_tool_calls_recovers_nested_duplicate_call():
+    block = (
+        "<function=search>\n<parameter=query>\n"
+        "satellite<tool_call>\n<function=search>\n<parameter=query>\n"
+        "satellite\n</parameter>\n</function>"
+    )
+    calls = parse_tool_calls([block])
+    arguments = json.loads(calls[0]["function"]["arguments"])
+    assert arguments["query"] == "satellite"
+
+
 def test_parse_tool_calls_ignores_malformed():
     assert parse_tool_calls(["", "no function here", "<function=>\n</function>"]) == []
 
@@ -157,9 +215,36 @@ def test_to_chat_messages_merges_system_and_flattens_parts():
     assert converted[1] == {"role": "user", "content": "ask"}
     assert converted[2]["role"] == "assistant"
     assert converted[2]["tool_calls"][0]["function"]["name"] == "search"
+    # The Qwen template iterates arguments as a mapping, not a JSON string.
+    assert converted[2]["tool_calls"][0]["function"]["arguments"] == {}
     assert converted[3] == {"role": "tool", "content": "result"}
     # The empty assistant message is dropped.
     assert len(converted) == 4
+
+
+def test_to_chat_messages_parses_arguments_and_drops_junk():
+    converted = to_chat_messages(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "read",
+                            "arguments": '{"pages": "2"}',
+                        },
+                    },
+                    {"function": {"name": "bad", "arguments": "{not json"}},
+                    "not-a-call",
+                ],
+            }
+        ]
+    )
+    calls = converted[0]["tool_calls"]
+    assert calls[0]["function"]["arguments"] == {"pages": "2"}
+    assert calls[1]["function"]["arguments"] == {}
 
 
 def test_to_chat_messages_ignores_images():
@@ -181,10 +266,10 @@ def test_filter_exposes_mode_and_blocks():
     flt.feed("<think>")
     assert flt.mode == "think"
     flt.feed("</think>")
-    flt.feed("<tool_call>")
+    flt.feed("<tool_call><function=search>")
     assert flt.mode == "tool"
     assert flt.blocks == []
-    flt.feed("</tool_call>")
+    flt.feed("</function></tool_call>")
     assert flt.mode == "text"
     assert len(flt.blocks) == 1
 

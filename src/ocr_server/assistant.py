@@ -20,6 +20,7 @@ import os
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Any, AsyncIterator, Iterator
 
 from .assistant_parser import (
@@ -32,7 +33,12 @@ log = logging.getLogger("ocr_server.assistant")
 
 DEFAULT_MODEL = "mlx-community/Qwen3.5-9B-MLX-8bit"
 DEFAULT_MAX_TOKENS = 1024
-DEFAULT_TEMPERATURE = 0.3
+#: Qwen3.5's evaluated best-practice sampling (model card). Without the
+#: presence penalty the small models loop on repeated parameter values.
+DEFAULT_TEMPERATURE = 1.0
+DEFAULT_TOP_P = 0.95
+DEFAULT_TOP_K = 20
+DEFAULT_PRESENCE_PENALTY = 1.5
 
 STATE_NOT_DOWNLOADED = "not_downloaded"
 STATE_DOWNLOADING = "downloading"
@@ -51,6 +57,55 @@ class ModelNotReady(RuntimeError):
 
 def _now() -> int:
     return int(time.time())
+
+
+def _dir_size(root: Path) -> int:
+    """Total bytes of files under a directory (missing dirs are zero)."""
+    total = 0
+    for base, _dirs, files in os.walk(root):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(base, name))
+            except OSError:
+                continue
+    return total
+
+
+def sampling_kwargs(request: dict[str, Any]) -> dict[str, Any]:
+    """Generation options with Qwen3.5 best-practice defaults applied."""
+    kwargs: dict[str, Any] = {
+        "max_tokens": _coerce_int(
+            request.get("max_tokens"), DEFAULT_MAX_TOKENS
+        ),
+        "temperature": _coerce_float(
+            request.get("temperature"), DEFAULT_TEMPERATURE
+        ),
+        "top_p": _coerce_float(request.get("top_p"), DEFAULT_TOP_P),
+        "top_k": _coerce_int(request.get("top_k"), DEFAULT_TOP_K),
+        "presence_penalty": _coerce_float(
+            request.get("presence_penalty"), DEFAULT_PRESENCE_PENALTY
+        ),
+    }
+    if request.get("repetition_penalty") is not None:
+        kwargs["repetition_penalty"] = _coerce_float(
+            request.get("repetition_penalty"), 1.0
+        )
+    return kwargs
+
+
+def _coerce_float(value: Any, fallback: float) -> float:
+    """Sampling options arrive as JSON; nulls and junk fall back to defaults."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _coerce_int(value: Any, fallback: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
 
 
 def _chunk(
@@ -111,16 +166,24 @@ class AssistantRuntime:
     def _is_downloaded(self) -> bool:
         try:
             from huggingface_hub import snapshot_download
-            from huggingface_hub.errors import LocalEntryNotFoundError
+            from huggingface_hub import try_to_load_from_cache
         except ImportError:  # pragma: no cover - extra missing
             return False
         try:
             snapshot_download(self.model_ref, local_files_only=True)
-        except LocalEntryNotFoundError:
+            return True
+        except Exception:
+            # Newer hubs raise IncompleteSnapshotError for caches written by
+            # other tools (missing metadata files) even when the weights are
+            # present — and that error subclasses LocalEntryNotFoundError; a
+            # cached config is the practical signal, since loading can
+            # complete the snapshot when the network is available.
+            pass
+        try:
+            cached = try_to_load_from_cache(self.model_ref, "config.json")
+            return isinstance(cached, str)
+        except Exception:  # pragma: no cover - defensive
             return False
-        except Exception:  # pragma: no cover - defensive: any cache error means absent
-            return False
-        return True
 
     def start_download(self) -> None:
         """Kick off download+load in the background (idempotent)."""
@@ -155,32 +218,51 @@ class AssistantRuntime:
             self.detail = str(exc)
 
     def _download_sync(self) -> None:  # pragma: no cover - network + weights
-        from functools import partial
+        from huggingface_hub import HfApi, snapshot_download
 
-        from huggingface_hub import snapshot_download
-        from tqdm.auto import tqdm
-
-        runtime = self
-
-        class _ProgressTqdm(tqdm):  # type: ignore[misc]
-            def __init__(self, *args: Any, **kwargs: Any) -> None:
-                kwargs.setdefault("disable", True)
-                super().__init__(*args, **kwargs)
-
-            def update(self, n: int | float | None = 1) -> Any:
-                result = super().update(n)
-                total = float(self.total or 0)
-                if total > 0:
-                    runtime._set_progress(float(self.n) / total)
-                return result
-
+        total = 0
+        cache_dir = self._cache_dir()
         try:
-            snapshot_download(
-                self.model_ref, tqdm_class=partial(_ProgressTqdm)
-            )
-        except TypeError:
-            # Older huggingface_hub without tqdm_class plumbing.
+            info = HfApi().model_info(self.model_ref, files_metadata=True)
+            total = sum(int(sibling.size or 0) for sibling in info.siblings or [])
+        except Exception:
+            total = 0
+        stop: threading.Event | None = None
+        if total > 0 and cache_dir is not None:
+            stop = self._start_progress_poll(cache_dir, total)
+        try:
             snapshot_download(self.model_ref)
+        finally:
+            if stop is not None:
+                stop.set()
+
+    def _cache_dir(self) -> Path | None:
+        """Local Hugging Face cache directory for the pinned model."""
+        try:
+            from huggingface_hub.constants import HF_HUB_CACHE
+        except ImportError:  # pragma: no cover - extra missing
+            return None
+        org, _, name = self.model_ref.partition("/")
+        if not name:
+            return None
+        return Path(HF_HUB_CACHE) / f"models--{org}--{name}"
+
+    def _start_progress_poll(
+        self, cache_dir: Path, total: int
+    ) -> threading.Event:  # pragma: no cover - poll loop
+        """Report download progress from cache growth (hub tqdm is opaque)."""
+        stop = threading.Event()
+
+        def poll() -> None:
+            while not stop.wait(0.5):
+                if self.state != STATE_DOWNLOADING:
+                    return
+                size = _dir_size(cache_dir)
+                if size > 0:
+                    self._set_progress(min(0.95, size / total))
+
+        threading.Thread(target=poll, daemon=True).start()
+        return stop
 
     def _load_sync(self) -> None:  # pragma: no cover - loads MLX weights
         from mlx_vlm import load
@@ -230,27 +312,38 @@ class AssistantRuntime:
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         model = str(request.get("model") or self.model_ref)
-        temperature = float(request.get("temperature", DEFAULT_TEMPERATURE))
-        max_tokens = int(request.get("max_tokens") or DEFAULT_MAX_TOKENS)
+        options = sampling_kwargs(request)
         flt = QwenStreamFilter()
+        token_ids: list[int] = []
+        saw_text = False
         for response in stream_generate(
             self._model,
             self._processor,
             prompt,
             image=None,
-            max_tokens=max_tokens,
-            temperature=temperature,
+            **options,
         ):
             if stop.is_set():
                 break
             if getattr(response, "is_draft", False):
                 continue
-            text = getattr(response, "text", None)
-            if not text and getattr(response, "token", None) is not None:
-                text = tokenizer.decode([int(response.token)])
+            token = getattr(response, "token", None)
+            if token is not None:
+                token_ids.append(int(token))
+            # mlx-vlm yields empty-text results while the detokenizer buffers
+            # a token; decoding those here would duplicate the text when the
+            # buffer later flushes. Only `.text` deltas are authoritative.
+            text = getattr(response, "text", None) or ""
             if not text:
                 continue
+            saw_text = True
             emitted = flt.feed(text)
+            if emitted:
+                yield _chunk(completion_id, model, {"content": emitted})
+        if not saw_text and token_ids:
+            # Degenerate tokenizers that never emit text: decode once.
+            decoded = tokenizer.decode(token_ids, skip_special_tokens=True)
+            emitted = flt.feed(decoded)
             if emitted:
                 yield _chunk(completion_id, model, {"content": emitted})
         tail, blocks = flt.finish()

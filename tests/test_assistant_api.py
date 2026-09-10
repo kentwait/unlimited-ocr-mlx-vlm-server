@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from typing import Any
 
 import pytest
@@ -19,6 +20,10 @@ from ocr_server.assistant import (
     AssistantUnavailable,
     FakeAssistantRuntime,
     ModelNotReady,
+    _coerce_float,
+    _coerce_int,
+    _dir_size,
+    sampling_kwargs,
 )
 
 TOOLS = [
@@ -133,6 +138,72 @@ def test_failed_model_raises_with_detail(monkeypatch):
     runtime.detail = "download blew up"
     with pytest.raises(ModelNotReady, match="download blew up"):
         runtime.ensure_loaded()
+
+
+def test_dir_size_counts_missing_and_present(tmp_path):
+    assert _dir_size(tmp_path / "missing") == 0
+    (tmp_path / "a.bin").write_bytes(b"x" * 10)
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / "b.bin").write_bytes(b"y" * 5)
+    assert _dir_size(tmp_path) == 15
+
+
+def test_download_progress_poll_tracks_cache_growth(tmp_path):
+
+    runtime = FakeAssistantRuntime()
+    runtime.state = "downloading"
+    (tmp_path / "blob").write_bytes(b"z" * 50)
+    stop = runtime._start_progress_poll(tmp_path, 100)
+    deadline = time.time() + 2
+    while runtime.progress == 1.0 or runtime.progress == 0.0:
+        if time.time() > deadline:
+            break
+        time.sleep(0.05)
+    stop.set()
+    assert runtime.progress is not None
+    assert 0.4 <= runtime.progress <= 0.95
+
+
+def test_sampling_kwargs_defaults_and_overrides():
+    defaults = sampling_kwargs({})
+    assert defaults["temperature"] == 1.0
+    assert defaults["top_p"] == 0.95
+    assert defaults["top_k"] == 20
+    assert defaults["presence_penalty"] == 1.5
+    assert "repetition_penalty" not in defaults
+
+    overridden = sampling_kwargs(
+        {
+            "temperature": None,
+            "top_p": "0.8",
+            "top_k": "40",
+            "presence_penalty": None,
+            "repetition_penalty": "1.1",
+        }
+    )
+    assert overridden["temperature"] == 1.0
+    assert overridden["top_p"] == 0.8
+    assert overridden["top_k"] == 40
+    assert overridden["presence_penalty"] == 1.5
+    assert overridden["repetition_penalty"] == 1.1
+
+
+def test_sampling_option_coercion():
+    assert _coerce_float(None, 0.3) == 0.3
+    assert _coerce_float("0.7", 0.3) == 0.7
+    assert _coerce_float("junk", 0.3) == 0.3
+    assert _coerce_int(None, 1024) == 1024
+    assert _coerce_int("512", 1024) == 512
+    assert _coerce_int("junk", 1024) == 1024
+
+
+def test_fake_chat_tolerates_null_sampling_options(client, fake_runtime):
+    response = client.post(
+        "/v1/chat/completions",
+        json=_chat_body(temperature=None, max_tokens=None),
+    )
+    assert response.status_code == 200
 
 
 # ---------- chat guards ----------
@@ -382,6 +453,83 @@ def test_stream_forwards_worker_errors():
                 pass
 
     asyncio.run(consume())
+
+
+class _FakeTokenizer:
+    def apply_chat_template(self, *args, **kwargs):
+        return "prompt"
+
+    def decode(self, ids, skip_special_tokens=True):
+        return "decoded"
+
+
+def test_iter_chunks_does_not_double_count_buffered_tokens(monkeypatch):
+    """Regression: empty-text token yields must not replay flushed text."""
+    import importlib.machinery
+    import sys
+    import types
+    from types import SimpleNamespace
+
+    events = [
+        SimpleNamespace(text="", token=100, is_draft=False),
+        SimpleNamespace(text="The", token=100, is_draft=False),
+        SimpleNamespace(text=" human", token=101, is_draft=False),
+        SimpleNamespace(text="", token=None, is_draft=False),
+    ]
+    dispatch = types.ModuleType("mlx_vlm.generate.dispatch")
+    dispatch.__spec__ = importlib.machinery.ModuleSpec(
+        "mlx_vlm.generate.dispatch", None
+    )
+    dispatch.stream_generate = lambda *args, **kwargs: iter(events)
+    monkeypatch.setitem(sys.modules, "mlx_vlm.generate.dispatch", dispatch)
+
+    runtime = AssistantRuntime()
+    runtime.loaded = True
+    runtime._model = object()
+    runtime._processor = SimpleNamespace(tokenizer=_FakeTokenizer())
+    chunks = list(
+        runtime._iter_chunks(
+            {"messages": [{"role": "user", "content": "hi"}]},
+            threading.Event(),
+        )
+    )
+    text = "".join(
+        chunk["choices"][0]["delta"].get("content", "") for chunk in chunks
+    )
+    assert text == "The human"
+
+
+def test_iter_chunks_decodes_tokens_when_no_text_ever_arrives(monkeypatch):
+    import importlib.machinery
+    import sys
+    import types
+    from types import SimpleNamespace
+
+    events = [
+        SimpleNamespace(text="", token=1, is_draft=False),
+        SimpleNamespace(text="", token=2, is_draft=False),
+    ]
+    dispatch = types.ModuleType("mlx_vlm.generate.dispatch")
+    dispatch.__spec__ = importlib.machinery.ModuleSpec(
+        "mlx_vlm.generate.dispatch", None
+    )
+    dispatch.stream_generate = lambda *args, **kwargs: iter(events)
+    monkeypatch.setitem(sys.modules, "mlx_vlm.generate.dispatch", dispatch)
+
+    runtime = AssistantRuntime()
+    runtime.loaded = True
+    runtime._model = object()
+    runtime._processor = SimpleNamespace(tokenizer=_FakeTokenizer())
+    chunks = list(
+        runtime._iter_chunks(
+            {"messages": [{"role": "user", "content": "hi"}]},
+            threading.Event(),
+        )
+    )
+    text = "".join(
+        chunk["choices"][0]["delta"].get("content", "") for chunk in chunks
+    )
+    assert text == "decoded"
 
 
 def test_fake_stop_short_circuits_tool_turn():

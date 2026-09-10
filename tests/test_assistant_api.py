@@ -1127,29 +1127,33 @@ def test_models_endpoint_lists_catalog(client, fake_runtime):
     assert by_id[INT4]["label"] == "int4"
 
 
-def test_models_endpoint_unavailable(client, unavailable_runtime):
+def test_models_endpoint_unavailable(client, unavailable_runtime, monkeypatch):
+    monkeypatch.setattr(unavailable_runtime, "_is_downloaded", lambda ref: False)
     body = client.get("/assistant/models").json()
     assert body["available"] is False
     assert len(body["models"]) == len(assistant_mod.MODEL_CATALOG)
     assert all(model["downloaded"] is False for model in body["models"])
 
 
-def test_download_specific_model_then_use(client, fake_runtime):
+def test_download_does_not_hijack_active_model(client, fake_runtime):
     body = client.post(
         "/assistant/model/download", json={"model": INT4}
     ).json()
     assert body["state"] == "ready"
-    assert body["model"] == INT4
+    assert body["model"] == INT8  # the active model is unchanged
     by_id = {model["id"]: model for model in body["models"]}
     assert by_id[INT4]["downloaded"] is True
+    assert by_id[INT4]["active"] is False
+    assert by_id[INT8]["active"] is True
+
+
+def test_use_switches_to_downloaded_model(client, fake_runtime):
+    client.post("/assistant/model/download", json={"model": INT4})
+    body = client.post("/assistant/model/use", json={"model": INT4}).json()
+    assert body["model"] == INT4
+    by_id = {model["id"]: model for model in body["models"]}
     assert by_id[INT4]["active"] is True
     assert by_id[INT8]["active"] is False
-
-    back = client.post("/assistant/model/use", json={"model": INT8}).json()
-    assert back["model"] == INT8
-    by_id = {model["id"]: model for model in back["models"]}
-    assert by_id[INT8]["active"] is True
-    assert by_id[INT4]["active"] is False
 
 
 def test_use_not_downloaded_is_409(client, fake_runtime):
@@ -1320,3 +1324,54 @@ def test_fake_cancel_keeps_download_target(client, fake_runtime):
     body = client.post("/assistant/model/cancel").json()
     assert body["state"] == "paused"
     assert body["download_target"] == INT4
+
+
+# ---------- download never hijacks an existing model ----------
+
+
+def test_download_auto_loads_when_no_model_present(monkeypatch):
+    runtime = AssistantRuntime()
+    runtime.available = True
+    runtime.loaded = False
+    loaded: list[str] = []
+    monkeypatch.setattr(runtime, "_download_sync", lambda ref: None)
+    monkeypatch.setattr(runtime, "_load_sync", lambda ref: loaded.append(ref))
+    monkeypatch.setattr(runtime, "_is_downloaded", lambda ref: ref == INT4)
+    runtime._download_and_load(INT4)
+    assert loaded == [INT4]
+    assert runtime.model_ref == INT4
+    assert runtime.loaded is True
+    assert runtime.state == "ready"
+
+
+def test_download_does_not_hijack_when_another_is_downloaded(monkeypatch):
+    runtime = AssistantRuntime()
+    runtime.available = True
+    runtime.loaded = False
+    runtime.model_ref = INT8
+    loaded: list[str] = []
+    monkeypatch.setattr(runtime, "_download_sync", lambda ref: None)
+    monkeypatch.setattr(runtime, "_load_sync", lambda ref: loaded.append(ref))
+    # The selected model is downloaded but not resident: no auto-load.
+    monkeypatch.setattr(runtime, "_is_downloaded", lambda ref: ref == INT8)
+    runtime._download_and_load(INT4)
+    assert loaded == []
+    assert runtime.model_ref == INT8
+    assert runtime.loaded is False
+    assert runtime.state == "ready"
+
+
+def test_download_does_not_hijack_a_loaded_model(monkeypatch):
+    runtime = AssistantRuntime()
+    runtime.available = True
+    runtime.loaded = True
+    runtime.model_ref = INT8
+    loaded: list[str] = []
+    monkeypatch.setattr(runtime, "_download_sync", lambda ref: None)
+    monkeypatch.setattr(runtime, "_load_sync", lambda ref: loaded.append(ref))
+    monkeypatch.setattr(runtime, "_is_downloaded", lambda ref: ref == INT8)
+    runtime._download_and_load(INT4)
+    assert loaded == []
+    assert runtime.model_ref == INT8
+    assert runtime.loaded is True
+    assert runtime.state == "ready"

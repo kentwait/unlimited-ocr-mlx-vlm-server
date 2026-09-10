@@ -338,6 +338,20 @@ class AssistantRuntime:
     def _set_progress(self, value: float) -> None:
         self.progress = max(0.0, min(1.0, value))
 
+    def _should_auto_load(self, target: str) -> bool:
+        """True only when this download would leave the app with no model.
+
+        A download must never hijack an already-present model: if any other
+        catalog entry is downloaded (or one is resident) the newly downloaded
+        entry stays inactive until the user explicitly selects it.
+        """
+        if self.loaded:
+            return False
+        return not any(
+            spec.id != target and self._is_downloaded(spec.id)
+            for spec in self._catalog()
+        )
+
     def _download_and_load(self, target: str) -> None:  # pragma: no cover - weights
         try:
             self._download_sync(target)
@@ -345,12 +359,19 @@ class AssistantRuntime:
                 self.state = STATE_PAUSED
                 self.detail = "download cancelled"
                 return
-            self.state = STATE_LOADING
-            self._load_sync(target)
-            self.model_ref = target
+            if self._should_auto_load(target):
+                self.state = STATE_LOADING
+                self._load_sync(target)
+                self.model_ref = target
+                self.loaded = True
             self.progress = 1.0
             self.detail = None
-            self.state = STATE_READY
+            self._download_target = None
+            self.state = (
+                STATE_READY
+                if self.loaded or self._is_downloaded(self.model_ref)
+                else STATE_NOT_DOWNLOADED
+            )
         except DownloadCancelled:
             self.state = STATE_PAUSED
             self.detail = "download cancelled"
@@ -681,8 +702,13 @@ class FakeAssistantRuntime(AssistantRuntime):
         target = model or self.model_ref
         self._download_target = target
         self._fake_downloaded.add(target)
-        self.model_ref = target
-        self.loaded = True
+        # Mirror the real runtime: only adopt the newly downloaded entry when
+        # no other model is present; never hijack an existing one.
+        if not self.loaded and not any(
+            ref != target for ref in self._fake_downloaded
+        ):
+            self.model_ref = target
+            self.loaded = True
         self.state = STATE_READY
         self.progress = 1.0
         self.detail = None

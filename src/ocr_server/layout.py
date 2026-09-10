@@ -85,6 +85,11 @@ def _clean_text(value: object) -> str | None:
     text = " ".join(value.split())
     if not text:
         return None
+    # Small vision models sometimes quote the null ("null"/"none") instead
+    # of emitting bare JSON null — treat those as absent, otherwise the
+    # literal word would poison the OCR hint and the furniture filter.
+    if text.lower() in ("null", "none", "n/a", "nil", "-"):
+        return None
     return text[:200]
 
 

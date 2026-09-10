@@ -34,7 +34,10 @@ from pathlib import Path
 # ============================== USER CONFIG ==============================
 
 # Must be the SAME PDF / pages / work dir you used for scripts/compare_ocr.py.
-PDF_PATH = "/tmp/test-paper.pdf"  # <-- CHANGE: your test PDF
+# Default: the in-repo fixture (Altemose et al. 2022, 13 digital-born pages).
+PDF_PATH = str(  # <-- CHANGE: your test PDF
+    Path(__file__).resolve().parents[1] / "tests" / "assets" / "altemose2022.pdf"
+)
 PAGE_NUMBERS = [1, 2]  # <-- CHANGE: same pages as compare_ocr.py
 WORK_DIR = Path("/tmp/ocr-compare")  # <-- CHANGE: same dir as compare_ocr.py
 

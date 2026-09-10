@@ -18,16 +18,20 @@ repeated lines at the very top/bottom, NOT titles) and LARGE figures
 (photos, charts, diagrams occupying a big part of the page — NOT small
 inline graphics). Coordinates are 0-1000, origin top-left.
 
-OUTPUT FORMAT — strict JSON only, no commentary, no fences:
+OUTPUT FORMAT — strict JSON only, no commentary, no fences.
+Copy this shape and fill in what you actually see (the values below are
+only an example):
 
-{"columns": "1|2|3|mixed", "header": "exact running header text or null", "footer": "exact running footer text or null", "figures": [{"box": [x1, y1, x2, y2]}], "confidence": 0.0-1.0}
+{"columns": "2", "header": null, "footer": null, "figures": [], "confidence": 0.9}
 
 Rules:
 
-- columns: body-text columns below the title block ("mixed" when the
-  structure changes mid-page, e.g. full-width title over two columns).
-- header/footer: exact visible text of the running line, or null when
-  none. Never report the paper title as furniture.
+- columns: write exactly ONE of "1", "2", "3", "mixed" — never the whole
+  option list, never a number without quotes. "mixed" when the structure
+  changes mid-page (e.g. full-width title over two columns).
+- header/footer: exact visible text of the running line, or bare JSON
+  null (unquoted) when none — never the quoted string "null". Never
+  report the paper title as furniture.
 - figures: only regions MUCH larger than a text line; omit the key
   entirely or use [] when none. Rough boxes are fine.
 - confidence: your certainty in the whole profile (0.5 when guessing).

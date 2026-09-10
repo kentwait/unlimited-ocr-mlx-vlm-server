@@ -326,7 +326,11 @@ class SupportEngine:
         from mlx_vlm.generate.dispatch import stream_generate
         from mlx_vlm.prompt_utils import apply_chat_template
 
-        formatted = apply_chat_template(self.processor, self.model.config, prompt)
+        # num_images=1 inserts the literal <image> placeholder the processor
+        # requires when an image is supplied (same as the OCR engine path).
+        formatted = apply_chat_template(
+            self.processor, self.model.config, prompt, num_images=1
+        )
         ids: list[int] = []
         early_stop = False
         for resp in stream_generate(

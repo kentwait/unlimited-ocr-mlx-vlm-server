@@ -61,6 +61,18 @@ def test_parse_rejects_garbage():
     assert parse_layout_profile('{"columns": "5"}', 1) is None
     assert parse_layout_profile('["columns", "2"]', 1) is None
     assert parse_layout_profile("", 1) is None
+    # Observed 2026-09-11 (real Qwen3.5-0.8B weights): the model echoed the
+    # schema's option list instead of choosing one — must not parse.
+    assert parse_layout_profile('{"columns": "1|2|3|mixed"}', 1) is None
+
+
+def test_parse_treats_quoted_null_furniture_as_absent():
+    # Observed 2026-09-11 (real weights): "footer": "null" (quoted) — the
+    # literal word must not leak into the hint or the filter.
+    p = parse_layout_profile('{"columns": "2", "header": "None", "footer": "null"}', 1)
+    assert p is not None and p.header is None and p.footer is None
+    p = parse_layout_profile('{"columns": "2", "footer": "N/A"}', 1)
+    assert p is not None and p.footer is None
 
 
 def test_parse_drops_degenerate_boxes_and_clamps_confidence():

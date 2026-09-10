@@ -47,6 +47,13 @@ Findings:
    wall-clock in the worst case and ~2× in the loop case it avoids.
 3. mlx-community bf16 ≡ official `baidu/Unlimited-OCR` (byte-identical
    behavior) — either is fine; prefer the community one for smaller download.
+4. Dense-paper caveat (2026-09-11, real pipeline run on
+   `tests/assets/altemose2022.pdf`, Science 2-column @300dpi): mxfp8 looped
+   instantly on body pages 2–3 (`header [60]…` repetition, 48 tok,
+   early-stop) while bf16 completed them cleanly (2792/1454 tok, no loops,
+   0 invented words after support). 300 dpi is loop-free for the benchmark
+   dense page above but not for denser stock — treat `early_stop=true` as
+   the signal to retry the page with `ocr_model=bf16`.
 
 ## Cleanup stage (Qwen3.5 sizes × quants)
 

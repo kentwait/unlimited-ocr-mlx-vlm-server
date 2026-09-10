@@ -45,7 +45,10 @@ from pathlib import Path
 
 # Path to the test PDF. It must have an embedded text layer (i.e. text you can
 # select/copy in a PDF viewer), which is used as the scoring ground truth.
-PDF_PATH = "/tmp/test-paper.pdf"  # <-- CHANGE: your test PDF   [env: OCR_CMP_PDF]
+# Default: the in-repo fixture (Altemose et al. 2022, 13 digital-born pages).
+PDF_PATH = str(  # <-- CHANGE: your test PDF   [env: OCR_CMP_PDF]
+    Path(__file__).resolve().parents[1] / "tests" / "assets" / "altemose2022.pdf"
+)
 
 # Which pages to benchmark (1-indexed). Two or three pages is usually enough;
 # include at least one dense page (e.g. two-column body text).

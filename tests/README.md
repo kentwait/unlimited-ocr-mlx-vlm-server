@@ -7,6 +7,12 @@
 | `test_pipeline.py` | Full pipeline with stubbed LLM (`CleanupEngine._generate` canned) | Python only |
 | `test_properties.py` | Hypothesis invariants + API fuzzing (fake engine) | Python only |
 
+`assets/altemose2022.pdf` — committed test PDF (Altemose et al. 2022, 13
+digital-born pages, text layer intact). Default `PDF_PATH` for
+`scripts/compare_ocr.py` / `compare_cleanup.py` (override with
+`OCR_CMP_PDF`); `test_altemose.py` runs the real file through the
+layout-first pipeline with stubbed LLM calls (no weights).
+
 ## Coverage
 
 `make coverage` enforces **95%** (`--cov-fail-under=95`; currently 100%).
